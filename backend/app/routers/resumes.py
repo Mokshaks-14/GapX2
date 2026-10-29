@@ -81,14 +81,16 @@ async def upload_resume(
         readiness_level=analysis["readiness_level"],
         resume_data=analysis
     )
+    first_resume = db.query(models.Resume).filter(models.Resume.user_id == current_user.id).count() == 0
     db.add(db_resume)
-    
-    # Update user XP (+150 XP)
-    current_user.xp += 150
-    # Add Achievement Notification
+
+    # XP only for the first resume so repeated uploads can't be farmed
+    if first_resume:
+        current_user.xp += 150
+        current_user.level = max(current_user.level, current_user.xp // 500 + 1)
     notif = models.Notification(
         user_id=current_user.id,
-        title="Resume Analyzed! (+150 XP)",
+        title="Resume Analyzed!" + (" (+150 XP)" if first_resume else ""),
         message=f"Your resume '{file.filename}' was analyzed successfully. Your ATS score is {analysis['ats_score']}/100. Review missing skills and keywords on your resume panel.",
         type="Achievement"
     )
@@ -107,7 +109,7 @@ def create_manual_resume(
     validate_profile_links(resume_in.linkedin, resume_in.github)
     
     # Convert manual form input to dict
-    resume_data_dict = resume_in.dict()
+    resume_data_dict = resume_in.model_dump()
     if not resume_data_dict.get("email"):
         resume_data_dict["email"] = current_user.email
     if not resume_data_dict.get("name"):
@@ -130,13 +132,15 @@ def create_manual_resume(
         readiness_level=analysis["readiness_level"],
         resume_data=analysis
     )
+    first_resume = db.query(models.Resume).filter(models.Resume.user_id == current_user.id).count() == 0
     db.add(db_resume)
-    
-    # Update user XP (+150 XP)
-    current_user.xp += 150
+
+    if first_resume:
+        current_user.xp += 150
+        current_user.level = max(current_user.level, current_user.xp // 500 + 1)
     notif = models.Notification(
         user_id=current_user.id,
-        title="Standard ATS Resume Generated! (+150 XP)",
+        title="ATS Resume Generated!" + (" (+150 XP)" if first_resume else ""),
         message=f"Your standard ATS-optimized resume has been generated with an ATS Compatibility Score of {analysis['ats_score']}/100! You can download the PDF anytime.",
         type="Achievement"
     )
@@ -145,13 +149,21 @@ def create_manual_resume(
     db.commit()
     return analysis
 
+@router.post("/generate-summary", response_model=schemas.ResumeSummaryResponse)
+def generate_resume_summary(resume_in: schemas.ManualResumeCreate, current_user: models.User = Depends(get_current_user)):
+    """Writes a professional summary (introduction) from the candidate's own resume details."""
+    data = resume_in.model_dump()
+    if not data.get("headline") and current_user.target_roles:
+        data["headline"] = current_user.target_roles[0]
+    return {"summary": AIService.write_resume_summary(data)}
+
 @router.post("/download-pdf")
 def download_resume_pdf_post(
     resume_in: schemas.ManualResumeCreate,
     current_user: models.User = Depends(get_current_user)
 ):
     validate_profile_links(resume_in.linkedin, resume_in.github)
-    data = resume_in.dict()
+    data = resume_in.model_dump()
     if not data.get("email"):
         data["email"] = current_user.email
     if not data.get("name"):

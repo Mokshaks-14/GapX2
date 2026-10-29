@@ -1,36 +1,43 @@
-import random
-from typing import Dict, Any
+from typing import Any, Dict, List, Optional
+
+
+def _clamp(value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    return min(max(float(value), 0.0), 1.0)
+
 
 class BehaviorAnalyzer:
+    """Turns face-analysis metrics measured in the browser into interview behavior scores.
+
+    The browser runs MediaPipe Face Landmarker on the webcam feed and sends attention, smile,
+    stress (brow tension) and eye-contact ratios between 0 and 1. When the camera is off or the
+    model can't load, the metrics are None and no face-based scores are produced.
+    """
 
     @staticmethod
-    def analyze_frame_telemetry(attention: float, smile: float, stress: float, eye_contact: float) -> Dict[str, Any]:
-        """Calculates behavioral analytics based on video/face telemetry received from the frontend."""
-        
-        # Normalize inputs
-        attention = min(max(attention, 0.0), 1.0)
-        smile = min(max(smile, 0.0), 1.0)
-        stress = min(max(stress, 0.0), 1.0)
-        eye_contact = min(max(eye_contact, 0.0), 1.0)
-        
-        # Calculate dynamic derived metrics
-        confidence = (attention * 0.4) + (eye_contact * 0.4) + ((1 - stress) * 0.2)
-        engagement = (attention * 0.6) + (smile * 0.2) + (eye_contact * 0.2)
-        
-        # Categorize emotion
+    def analyze_frame_telemetry(attention: Optional[float], smile: Optional[float], stress: Optional[float],
+                                eye_contact: Optional[float]) -> Dict[str, Any]:
+        attention, smile, stress, eye_contact = map(_clamp, (attention, smile, stress, eye_contact))
+        if attention is None or eye_contact is None:
+            return {"has_face_data": False}
+
+        smile = smile if smile is not None else 0.3
+        stress = stress if stress is not None else 0.2
+        confidence = attention * 0.4 + eye_contact * 0.4 + (1 - stress) * 0.2
+        engagement = attention * 0.6 + smile * 0.2 + eye_contact * 0.2
+
         if stress > 0.6:
-            emotion = "Anxious"
+            emotion = "Tense"
         elif smile > 0.4:
-            emotion = "Confident / Happy"
+            emotion = "Positive / Relaxed"
         elif attention < 0.4:
             emotion = "Distracted"
         else:
             emotion = "Focused / Neutral"
-            
-        # Give head movement estimates (mock variation)
-        head_movement = "Normal / Minimal" if attention > 0.7 else "Frequent"
-        
+
         return {
+            "has_face_data": True,
             "attention_score": round(attention * 100, 1),
             "smile_score": round(smile * 100, 1),
             "stress_score": round(stress * 100, 1),
@@ -38,45 +45,43 @@ class BehaviorAnalyzer:
             "confidence_score": round(confidence * 100, 1),
             "engagement_score": round(engagement * 100, 1),
             "detected_emotion": emotion,
-            "head_movement": head_movement,
-            "disclaimer": "This analysis is generated using facial expression telemetry for self-improvement and may not always be 100% accurate."
         }
 
     @staticmethod
-    def get_aggregate_behavior_report(session_telemetry_list: list) -> Dict[str, Any]:
-        """Computes summary metrics for a full mock interview session."""
-        if not session_telemetry_list:
+    def get_aggregate_behavior_report(session: List[Dict[str, Any]]) -> Dict[str, Any]:
+        frames = [x for x in session if x.get("has_face_data")]
+        if not frames:
             return {
-                "avg_attention": 85.0,
-                "avg_smile": 45.0,
-                "avg_stress": 20.0,
-                "avg_eye_contact": 80.0,
-                "overall_behavior_rating": "Excellent"
+                "has_face_data": False,
+                "overall_behavior_rating": "Not measured",
+                "body_language_feedback": "Camera analysis wasn't available for this session, so no body-language scores were recorded.",
             }
-            
-        total_att = sum(x.get("attention_score", 85) for x in session_telemetry_list)
-        total_sml = sum(x.get("smile_score", 45) for x in session_telemetry_list)
-        total_str = sum(x.get("stress_score", 20) for x in session_telemetry_list)
-        total_eye = sum(x.get("eye_contact_score", 80) for x in session_telemetry_list)
-        n = len(session_telemetry_list)
-        
-        avg_att = total_att / n
-        avg_sml = total_sml / n
-        avg_str = total_str / n
-        avg_eye = total_eye / n
-        
-        overall_rating = "Excellent"
-        if avg_str > 45 or avg_att < 60:
-            overall_rating = "Needs Improvement"
-        elif avg_att < 80 or avg_eye < 70:
-            overall_rating = "Good"
-            
+
+        def avg(key: str) -> float:
+            return round(sum(f[key] for f in frames) / len(frames), 1)
+
+        att, sml, strs, eye, conf = avg("attention_score"), avg("smile_score"), avg("stress_score"), avg("eye_contact_score"), avg("confidence_score")
+        if strs > 45 or att < 60:
+            rating = "Needs Improvement"
+        elif att < 80 or eye < 70:
+            rating = "Good"
+        else:
+            rating = "Excellent"
+
+        tips = []
+        if eye < 70:
+            tips.append("Look at the camera more often; it reads as eye contact to the interviewer.")
+        if att < 70:
+            tips.append("Keep your face centred and avoid looking away for long periods.")
+        if strs > 40:
+            tips.append("Your brow looked tense at times. Slow breathing before answering helps you appear calmer.")
+        if sml < 15:
+            tips.append("An occasional smile, especially when greeting and closing, comes across as confident and friendly.")
+
         return {
-            "avg_attention": round(avg_att, 1),
-            "avg_smile": round(avg_sml, 1),
-            "avg_stress": round(avg_str, 1),
-            "avg_eye_contact": round(avg_eye, 1),
-            "overall_behavior_rating": overall_rating,
-            "head_movement": "Stable / Concentrated",
-            "body_language_feedback": "Maintained direct posture. Avoided hand-to-face touching. Excellent overall presentation."
+            "has_face_data": True,
+            "avg_attention": att, "avg_smile": sml, "avg_stress": strs, "avg_eye_contact": eye, "avg_confidence": conf,
+            "overall_behavior_rating": rating,
+            "body_language_feedback": " ".join(tips) or "Steady eye contact and composed expression throughout. Well done.",
+            "disclaimer": "Estimated from facial landmarks in your browser; treat it as a self-improvement guide, not an exact measurement.",
         }

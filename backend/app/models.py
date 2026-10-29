@@ -27,6 +27,7 @@ class User(Base):
     xp = Column(Integer, default=0)
     level = Column(Integer, default=1)
     streak = Column(Integer, default=0)
+    last_active_date = Column(String, nullable=True)  # ISO date of last XP-earning activity (for daily streaks)
     badges = Column(JSON, default=list) # List of earned badge IDs/Names
     
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -107,6 +108,8 @@ class CodingProblem(Base):
     test_cases = Column(JSON, nullable=False)
     hints = Column(JSON, default=list) # List of string hints
     editorial = Column(Text, nullable=True)
+    # How the test runner calls the solution: {"fn": "twoSum", "params": [["nums", "int[]"], ...], "returns": "int[]"}
+    signature = Column(JSON, nullable=True)
     
     submissions = relationship("CodingSubmission", back_populates="problem", cascade="all, delete-orphan")
 

@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 from datetime import datetime
 
 # --- AUTH SCHEMAS ---
@@ -11,6 +11,9 @@ class UserCreate(BaseModel):
 class UserLogin(BaseModel):
     email: str
     password: str
+
+class GoogleLoginRequest(BaseModel):
+    credential: str  # Google Identity Services ID token
 
 class Token(BaseModel):
     access_token: str
@@ -79,9 +82,10 @@ class ManualResumeCreate(BaseModel):
     github: Optional[str] = None
     portfolio: Optional[str] = None
     summary: Optional[str] = None
-    education: Optional[str] = "Bachelor of Technology in Computer Science"
+    education: Optional[str] = None
+    college: Optional[str] = None
     semester: Optional[str] = None
-    cgpa: Optional[float] = None
+    cgpa: Optional[Union[float, str]] = None
     education_items: Optional[List[Dict[str, Any]]] = None
     skills: List[str] = []
     languages: List[str] = []
@@ -93,6 +97,11 @@ class ManualResumeCreate(BaseModel):
     certifications: Optional[List[str]] = []
     achievements: Optional[List[str]] = []
     hackathons: Optional[List[str]] = []
+    interests: Optional[List[str]] = []
+    is_fresher: Optional[bool] = None
+
+class ResumeSummaryResponse(BaseModel):
+    summary: str
 
 class ResumeAnalysisResponse(BaseModel):
     ats_score: int
@@ -152,6 +161,9 @@ class CodingProblemBase(BaseModel):
     starter_code_c: Optional[str] = None
     starter_code_js: Optional[str]
     hints: List[str]
+    editorial: Optional[str] = None
+    test_cases: List[Dict[str, Any]] = []  # public examples only; hidden cases never leave the server
+    hidden_test_count: int = 0
 
     class Config:
         from_attributes = True
@@ -211,41 +223,54 @@ class CodingTestResponse(BaseModel):
 class InterviewStartRequest(BaseModel):
     target_role: str
     experience_level: str
-    interview_type: str # Technical, HR, Behavioral, Managerial, Mixed
+    interview_type: str  # Technical, HR, Mixed
     job_description: Optional[str] = None
     specific_skills: Optional[List[str]] = None
-    topic_domain: Optional[str] = "AIML"
+    track: Optional[str] = None          # frontend, backend, fullstack, sde, data_science, ml, devops, mobile, data_analyst, security
+    topic_domain: Optional[str] = None   # legacy alias for track
+    num_questions: Optional[int] = 8
 
 class InterviewStartResponse(BaseModel):
     interview_id: int
     first_question: str
     speech_text: Optional[str] = None
     difficulty: Optional[str] = "Easy"
+    phase: Optional[str] = None
+    track: Optional[str] = None
+    track_label: Optional[str] = None
+    total_questions: Optional[int] = None
 
 class InterviewMessageRequest(BaseModel):
     answer: str
     audio_response: Optional[bool] = False
-    attention_metric: Optional[float] = 1.0  # Facial expression indicators
-    smile_metric: Optional[float] = 0.5
-    stress_metric: Optional[float] = 0.2
-    eye_contact_metric: Optional[float] = 1.0
-    wpm_metric: Optional[int] = 135
-    filler_words_count: Optional[int] = 0
-    current_difficulty: Optional[str] = "Easy"
-    topic_domain: Optional[str] = "AIML"
+    # Face-analysis metrics (0..1) from the browser. Omitted when the camera is off or analysis is unavailable.
+    attention_metric: Optional[float] = None
+    smile_metric: Optional[float] = None
+    stress_metric: Optional[float] = None
+    eye_contact_metric: Optional[float] = None
+    wpm_metric: Optional[int] = None
+    filler_words_count: Optional[int] = None
+    current_difficulty: Optional[str] = None
+    topic_domain: Optional[str] = None
 
 class InterviewMessageResponse(BaseModel):
-    next_question: Optional[str] # Null if finished
+    next_question: Optional[str]  # None when finished
     is_finished: bool
+    is_repeat: bool = False
     ai_immediate_feedback: Optional[str] = None
     is_correct: Optional[bool] = True
     ai_correction: Optional[str] = None
     ideal_answer: Optional[str] = None
     speech_text_to_speak: Optional[str] = None
-    current_live_score: Optional[int] = 80
-    confidence_metric: Optional[int] = 85
+    current_live_score: Optional[int] = None
+    confidence_metric: Optional[int] = None
     difficulty: Optional[str] = "Easy"
     difficulty_change: Optional[str] = "same"
+    phase: Optional[str] = None
+    question_kind: Optional[str] = None
+    question_number: Optional[int] = None
+    total_questions: Optional[int] = None
+    turn_score: Optional[int] = None
 
 class InterviewFeedbackResponse(BaseModel):
     id: int

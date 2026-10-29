@@ -44,6 +44,9 @@ pip install -r requirements.txt
 ```
 
 #### Setup Environment Variables (Optional)
+Copy `backend/.env.example` to `backend/.env`. Key settings: `ADMIN_EMAILS` (who is admin), `GOOGLE_CLIENT_ID` (real Google sign-in), `GEMINI_API_KEY` / `OPENAI_API_KEY` (AI), `JUDGE0_API_KEY` (sandboxed code execution, required in production). The frontend reads `NEXT_PUBLIC_API_URL` (default `http://127.0.0.1:8000`).
+
+Older minimal example:
 Create a `.env` file in the `backend/` folder:
 ```env
 # Optional: Add Google Gemini or OpenAI Key for real AI generation (otherwise robust fallback mock is used)
@@ -62,6 +65,13 @@ uvicorn app.main:app --reload --port 8000
 * Interactive API Documentation will be available at: [http://localhost:8000/docs](http://localhost:8000/docs)
 
 ---
+
+#### Run the tests
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+The suite runs a reference solution for every coding problem through the real runner, and covers auth, interviews, roadmaps, resumes and XP rules.
 
 ### 2. Frontend client Setup
 Ensure you have Node.js 18+ installed on your system.

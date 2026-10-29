@@ -1,90 +1,74 @@
 from datetime import datetime, timedelta
-from typing import Union, Any
-from jose import jwt, JWTError
+from typing import Any, Optional, Union
+
 import bcrypt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError, jwt
 from sqlalchemy.orm import Session
+
+from app import models
 from app.core.config import settings
 from app.core.database import get_db
-from app import models
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.API_V1_STR}/auth/login")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.API_V1_STR}/auth/login", auto_error=False)
+
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     try:
-        pw_bytes = plain_password.encode('utf-8')[:72]
-        hash_bytes = hashed_password.encode('utf-8')
-        return bcrypt.checkpw(pw_bytes, hash_bytes)
+        return bcrypt.checkpw(plain_password.encode("utf-8")[:72], hashed_password.encode("utf-8"))
     except Exception:
         return False
 
+
 def get_password_hash(password: str) -> str:
-    pw_bytes = password.encode('utf-8')[:72]
-    salt = bcrypt.gensalt()
-    return bcrypt.hashpw(pw_bytes, salt).decode('utf-8')
+    return bcrypt.hashpw(password.encode("utf-8")[:72], bcrypt.gensalt()).decode("utf-8")
 
-def create_access_token(subject: Union[str, Any], expires_delta: timedelta = None) -> str:
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode = {"exp": expire, "sub": str(subject)}
-    encoded_jwt = jwt.encode(to_encode, settings.JWT_SECRET, algorithm=settings.ALGORITHM)
-    return encoded_jwt
 
-def get_current_user(db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)) -> models.User:
-    credentials_exception = HTTPException(
+def create_access_token(subject: Union[str, Any], expires_delta: Optional[timedelta] = None) -> str:
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES))
+    return jwt.encode({"exp": expire, "sub": str(subject)}, settings.JWT_SECRET, algorithm=settings.ALGORITHM)
+
+
+def _credentials_exception(detail: str = "Could not validate credentials") -> HTTPException:
+    return HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
+        detail=detail,
         headers={"WWW-Authenticate": "Bearer"},
     )
-    if not token or token in ["null", "undefined", "anonymous"]:
-        # Resilient fallback to active demo/first user
-        fallback = db.query(models.User).filter(models.User.email == "demo@gapx.ai").first() or db.query(models.User).first()
-        if fallback:
-            return fallback
-        raise credentials_exception
 
-    # Seamless support for local, demo, or guest session tokens
-    if token.startswith("local_") or token.startswith("demo_") or token.startswith("guest_"):
-        demo_user = db.query(models.User).filter(models.User.email == "demo@gapx.ai").first()
-        if not demo_user:
-            demo_user = db.query(models.User).first()
-        if not demo_user:
-            demo_user = models.User(
-                email="demo@gapx.ai",
-                password_hash=get_password_hash("demo123"),
-                full_name="Demo Student",
-                role="Student",
-                target_roles=["Software Engineer"]
-            )
-            db.add(demo_user)
-            db.commit()
-            db.refresh(demo_user)
-        return demo_user
 
+def user_from_token(db: Session, token: Optional[str]) -> Optional[models.User]:
+    """Returns the user a valid, unexpired token belongs to, or None."""
+    if not token:
+        return None
     try:
-        # Decodes token; ignores expiration to prevent abrupt session termination during resume building
-        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.ALGORITHM], options={"verify_exp": False})
-        user_id: str = payload.get("sub")
-        if user_id is None:
-            fallback = db.query(models.User).first()
-            if fallback:
-                return fallback
-            raise credentials_exception
-    except (JWTError, ValueError):
-        # Fallback to demo or first user if token signature changed between dev restarts
-        fallback = db.query(models.User).filter(models.User.email == "demo@gapx.ai").first() or db.query(models.User).first()
-        if fallback:
-            return fallback
-        raise credentials_exception
-        
-    user = db.query(models.User).filter(models.User.id == int(user_id)).first()
+        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.ALGORITHM])
+        user_id = int(payload.get("sub"))
+    except (JWTError, TypeError, ValueError):
+        return None
+    return db.query(models.User).filter(models.User.id == user_id).first()
+
+
+def get_current_user(db: Session = Depends(get_db), token: Optional[str] = Depends(oauth2_scheme)) -> models.User:
+    if not token:
+        raise _credentials_exception("Not authenticated")
+    user = user_from_token(db, token)
     if user is None:
-        # Fallback if user ID from token was wiped or migrated
-        fallback = db.query(models.User).first()
-        if fallback:
-            return fallback
-        raise credentials_exception
+        raise _credentials_exception("Session expired or invalid. Please sign in again.")
+    return user
+
+
+def get_optional_user(db: Session = Depends(get_db), token: Optional[str] = Depends(oauth2_scheme)) -> Optional[models.User]:
+    """For endpoints that work for guests too (e.g. the AI mentor)."""
+    return user_from_token(db, token)
+
+
+def is_admin(user: models.User) -> bool:
+    return bool(user.is_admin) or user.email.lower() in settings.admin_emails
+
+
+def get_admin_user(user: models.User = Depends(get_current_user)) -> models.User:
+    if not is_admin(user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Administrator privileges required.")
     return user

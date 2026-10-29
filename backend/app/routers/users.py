@@ -3,16 +3,15 @@ from sqlalchemy.orm import Session
 from typing import List
 from app import models, schemas
 from app.core.database import get_db
-from app.core.security import get_current_user
+from app.core.security import get_current_user, is_admin
 
 router = APIRouter(prefix="/users", tags=["Users & Onboarding"])
 
 @router.get("/me", response_model=schemas.UserResponse)
 def get_me(current_user: models.User = Depends(get_current_user)):
-    # Auto-flag admin users based on email or role
-    if current_user.email == "admin@gapx.ai" or current_user.email.startswith("admin"):
-        current_user.is_admin = True
-    return current_user
+    response = schemas.UserResponse.model_validate(current_user)
+    response.is_admin = is_admin(current_user)
+    return response
 
 @router.get("/readiness")
 def get_placement_readiness(
@@ -150,9 +149,6 @@ def onboard_user(
     flag_modified(current_user, "skills")
     flag_modified(current_user, "languages_known")
     flag_modified(current_user, "target_roles")
-    
-    if current_user.email == "admin@gapx.ai" or current_user.email.startswith("admin"):
-        current_user.is_admin = True
     
     # Award XP for onboarding completion!
     if current_user.xp == 0:

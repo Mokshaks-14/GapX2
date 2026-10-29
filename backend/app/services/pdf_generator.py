@@ -1,572 +1,304 @@
 import io
-from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether, HRFlowable
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+import re
+from typing import Any, Dict, List
+
 from reportlab.lib import colors
-from typing import Dict, Any
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.platypus import (HRFlowable, KeepTogether, ListFlowable, ListItem, PageBreak, Paragraph,
+                                SimpleDocTemplate, Spacer, Table, TableStyle)
 
+
+def esc(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _as_list(value: Any) -> List[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        parts = re.split(r"\n|;|,(?![^()]*\))", value) if "\n" in value or ";" in value else value.split(",")
+        return [p.strip(" •-\t") for p in parts if p.strip(" •-\t")]
+    if isinstance(value, (list, tuple)):
+        out = []
+        for v in value:
+            if isinstance(v, dict):
+                v = v.get("name") or v.get("title") or ""
+            if str(v).strip():
+                out.append(str(v).strip(" •-\t"))
+        return out
+    return [str(value)]
+
+
+def _link(url: str, label: str = None) -> str:
+    if not url:
+        return ""
+    href = url if url.startswith("http") else f"https://{url}"
+    shown = label or re.sub(r"^https?://(www\.)?", "", url).rstrip("/")
+    return f'<link href="{esc(href)}" color="#1d4ed8">{esc(shown)}</link>'
+
+
+# ═══════════════════════════ STUDY NOTES ═══════════════════════════
 class PDFNotesGenerator:
-    
+    """A4 study-notes PDFs: a single topic, or a whole-roadmap last-minute cheat sheet."""
+
     @staticmethod
-    def generate_notes_pdf(notes_data: Dict[str, Any]) -> io.BytesIO:
-        """Generates an exhaustive, beautifully styled academic PDF study sheet."""
-        buffer = io.BytesIO()
-        
-        # Setup document margins
-        doc = SimpleDocTemplate(
-            buffer,
-            pagesize=letter,
-            rightMargin=40,
-            leftMargin=40,
-            topMargin=40,
-            bottomMargin=40
-        )
-        
-        styles = getSampleStyleSheet()
-        
-        # Define premium color palette
-        primary_color = colors.HexColor("#312e81")    # Deep Indigo
-        accent_color = colors.HexColor("#4f46e5")     # Vibrant Indigo
-        emerald_color = colors.HexColor("#065f46")    # Emerald Green
-        dark_slate = colors.HexColor("#0f172a")       # Slate 900
-        muted_slate = colors.HexColor("#334155")      # Slate 700
-        light_bg = colors.HexColor("#f8fafc")         # Slate 50
-        border_color = colors.HexColor("#e2e8f0")     # Slate 200
-        card_bg = colors.HexColor("#f1f5f9")          # Slate 100
-        amber_color = colors.HexColor("#92400e")      # Amber 800
-        
-        # Custom typography styles
-        title_style = ParagraphStyle(
-            name="PDFTitle",
-            parent=styles["Title"],
-            fontName="Helvetica-Bold",
-            fontSize=20,
-            leading=24,
-            textColor=primary_color,
-            spaceAfter=4,
-            alignment=0
-        )
-        
-        meta_style = ParagraphStyle(
-            name="PDFMeta",
-            parent=styles["Normal"],
-            fontName="Helvetica-Bold",
-            fontSize=9.5,
-            leading=13,
-            textColor=accent_color,
-            spaceAfter=10
-        )
-        
-        h1_style = ParagraphStyle(
-            name="PDFH1",
-            parent=styles["Heading1"],
-            fontName="Helvetica-Bold",
-            fontSize=13,
-            leading=17,
-            textColor=primary_color,
-            spaceBefore=12,
-            spaceAfter=6,
-            keepWithNext=True
-        )
-        
-        h2_style = ParagraphStyle(
-            name="PDFH2",
-            parent=styles["Heading2"],
-            fontName="Helvetica-Bold",
-            fontSize=11,
-            leading=15,
-            textColor=accent_color,
-            spaceBefore=8,
-            spaceAfter=4,
-            keepWithNext=True
-        )
-        
-        body_style = ParagraphStyle(
-            name="PDFBody",
-            parent=styles["BodyText"],
-            fontName="Helvetica",
-            fontSize=9.5,
-            leading=14,
-            textColor=muted_slate,
-            spaceAfter=6
-        )
-        
-        code_style = ParagraphStyle(
-            name="PDFCode",
-            parent=styles["Normal"],
-            fontName="Courier",
-            fontSize=8.5,
-            leading=11.5,
-            textColor=dark_slate
-        )
-        
-        qa_q_style = ParagraphStyle(
-            name="PDFQAQ",
-            parent=styles["Normal"],
-            fontName="Helvetica-Bold",
-            fontSize=10,
-            leading=13,
-            textColor=emerald_color,
-            spaceAfter=3,
-            keepWithNext=True
-        )
-        
-        qa_a_style = ParagraphStyle(
-            name="PDFQAA",
-            parent=styles["Normal"],
-            fontName="Helvetica",
-            fontSize=9,
-            leading=13,
-            textColor=muted_slate,
-            spaceAfter=8
-        )
-        
-        table_header_style = ParagraphStyle(
-            name="PDFTH",
-            parent=styles["Normal"],
-            fontName="Helvetica-Bold",
-            fontSize=9,
-            leading=12,
-            textColor=colors.white
-        )
-        
-        table_cell_style = ParagraphStyle(
-            name="PDFTD",
-            parent=styles["Normal"],
-            fontName="Helvetica",
-            fontSize=8.5,
-            leading=11.5,
-            textColor=muted_slate
-        )
-        
-        story = []
-        
-        def safe_xml(s: Any) -> str:
-            if not isinstance(s, str):
-                s = str(s)
-            return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    def _styles():
+        base = getSampleStyleSheet()
+        return {
+            "title": ParagraphStyle("NTitle", parent=base["Title"], fontName="Helvetica-Bold", fontSize=18, leading=22,
+                                    textColor=colors.HexColor("#1e1b4b"), alignment=0, spaceAfter=2),
+            "meta": ParagraphStyle("NMeta", parent=base["Normal"], fontName="Helvetica", fontSize=9, textColor=colors.HexColor("#6366f1"), spaceAfter=8),
+            "h2": ParagraphStyle("NH2", parent=base["Heading2"], fontName="Helvetica-Bold", fontSize=11.5, leading=14,
+                                 textColor=colors.HexColor("#312e81"), spaceBefore=9, spaceAfter=4, keepWithNext=True),
+            "stage": ParagraphStyle("NStage", parent=base["Heading1"], fontName="Helvetica-Bold", fontSize=14, leading=18,
+                                    textColor=colors.white, backColor=colors.HexColor("#4f46e5"), borderPadding=(5, 6, 5, 6), spaceBefore=6, spaceAfter=8),
+            "topic": ParagraphStyle("NTopic", parent=base["Heading2"], fontName="Helvetica-Bold", fontSize=12, leading=15,
+                                    textColor=colors.HexColor("#1e1b4b"), spaceBefore=8, spaceAfter=3, keepWithNext=True),
+            "body": ParagraphStyle("NBody", parent=base["Normal"], fontName="Helvetica", fontSize=9.5, leading=13.5, textColor=colors.HexColor("#1f2937")),
+            "small": ParagraphStyle("NSmall", parent=base["Normal"], fontName="Helvetica", fontSize=8.5, leading=12, textColor=colors.HexColor("#374151")),
+            "code": ParagraphStyle("NCode", parent=base["Code"], fontName="Courier", fontSize=8, leading=10.5, backColor=colors.HexColor("#f3f4f6"),
+                                   borderPadding=6, textColor=colors.HexColor("#111827")),
+        }
 
-        # 1. Main Header Title & Metadata
-        title_val = safe_xml(notes_data.get("title", "Comprehensive Study Notes"))
-        stage_val = safe_xml(notes_data.get("stage", "Placement Preparation Track"))
-        role_val = safe_xml(notes_data.get("role", "Software Engineer"))
-        
-        story.append(Paragraph(f"{title_val}", title_style))
-        story.append(Paragraph(f"<b>Track:</b> {stage_val} &nbsp;|&nbsp; <b>Target Role:</b> {role_val} &nbsp;|&nbsp; <b>Platform:</b> GapX AI Skill Intelligence", meta_style))
-        story.append(HRFlowable(width="100%", thickness=1.5, color=accent_color, spaceAfter=10))
-        
-        # 2. Executive Definition & Academic Overview
-        story.append(Paragraph("1. Executive Definition & Conceptual Overview", h1_style))
-        summary_val = notes_data.get("executive_summary") or notes_data.get("introduction") or "Foundational study material."
-        story.append(Paragraph(safe_xml(summary_val), body_style))
-        story.append(Spacer(1, 4))
-        
-        # 3. Deep Internals & Low-Level Architecture (if available)
-        internals_val = notes_data.get("internals_and_architecture")
-        if internals_val:
-            story.append(Paragraph("2. Deep Internals, Memory Layout & Runtime Execution", h1_style))
-            story.append(Paragraph(safe_xml(internals_val), body_style))
-            story.append(Spacer(1, 4))
-        
-        # 4. Key Concepts Section
-        concepts = notes_data.get("key_concepts", [])
+    @staticmethod
+    def _bullets(items: List[str], style) -> ListFlowable:
+        return ListFlowable([ListItem(Paragraph(esc(i), style), leftIndent=10) for i in items if i],
+                            bulletType="bullet", start="•", leftIndent=12, bulletFontSize=8)
+
+    @staticmethod
+    def _topic_flowables(notes: Dict[str, Any], st: Dict[str, ParagraphStyle], compact: bool = False) -> list:
+        flow = []
+        if notes.get("executive_summary") and not compact:
+            flow += [Paragraph("Overview", st["h2"]), Paragraph(esc(notes["executive_summary"]), st["body"])]
+        if notes.get("internals_and_architecture") and not compact:
+            flow += [Paragraph("How it works", st["h2"]), Paragraph(esc(notes["internals_and_architecture"]), st["body"])]
+        concepts = notes.get("key_concepts") or []
         if concepts:
-            story.append(Paragraph("3. Core Theoretical Principles & Mechanisms", h1_style))
-            for concept in concepts:
-                name = safe_xml(concept.get("name", "Concept"))
-                explanation = safe_xml(concept.get("explanation", ""))
-                story.append(Paragraph(f"<b>• {name}:</b> {explanation}", body_style))
-            story.append(Spacer(1, 4))
-            
-        # 5. Complexity Analysis Table (if available)
-        complexities = notes_data.get("complexity_analysis", [])
-        if complexities:
-            story.append(Paragraph("4. Formal Complexity Analysis", h1_style))
-            table_data = [[
-                Paragraph("<b>Operation / Phase</b>", table_header_style),
-                Paragraph("<b>Time Complexity</b>", table_header_style),
-                Paragraph("<b>Space Complexity</b>", table_header_style),
-                Paragraph("<b>Trade-offs & Explanation</b>", table_header_style)
-            ]]
-            for c in complexities:
-                table_data.append([
-                    Paragraph(safe_xml(c.get("operation", "")), table_cell_style),
-                    Paragraph(f"<b>{safe_xml(c.get('time_complexity', 'O(1)'))}</b>", table_cell_style),
-                    Paragraph(f"<b>{safe_xml(c.get('space_complexity', 'O(1)'))}</b>", table_cell_style),
-                    Paragraph(safe_xml(c.get("explanation", "")), table_cell_style)
-                ])
-                
-            c_table = Table(table_data, colWidths=[130, 95, 95, 210])
-            c_table.setStyle(TableStyle([
-                ('BACKGROUND', (0,0), (-1,0), primary_color),
-                ('TOPPADDING', (0,0), (-1,-1), 5),
-                ('BOTTOMPADDING', (0,0), (-1,-1), 5),
-                ('LEFTPADDING', (0,0), (-1,-1), 6),
-                ('RIGHTPADDING', (0,0), (-1,-1), 6),
-                ('GRID', (0,0), (-1,-1), 0.5, border_color),
-                ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, light_bg]),
-                ('VALIGN', (0,0), (-1,-1), 'TOP'),
-            ]))
-            story.append(c_table)
-            story.append(Spacer(1, 8))
-        
-        # 6. Production Code Implementation Block
-        code_text = notes_data.get("code_example", "")
-        if code_text:
-            story.append(Paragraph("5. Placement-Ready Production Code Implementation", h1_style))
-            
-            # Format lines cleanly without overflow
-            formatted_lines = []
-            for line in code_text.split("\n"):
-                if len(line) > 85:
-                    line = line[:85] + "..."
-                formatted_lines.append(safe_xml(line).replace(" ", "&nbsp;"))
-            escaped_code = "<br/>".join(formatted_lines)
-            code_p = Paragraph(escaped_code, code_style)
-            
-            code_table = Table([[code_p]], colWidths=[530])
-            code_table.setStyle(TableStyle([
-                ('BACKGROUND', (0,0), (-1,-1), card_bg),
-                ('TOPPADDING', (0,0), (-1,-1), 8),
-                ('BOTTOMPADDING', (0,0), (-1,-1), 8),
-                ('LEFTPADDING', (0,0), (-1,-1), 10),
-                ('RIGHTPADDING', (0,0), (-1,-1), 10),
-                ('BOX', (0,0), (-1,-1), 1, border_color),
-            ]))
-            story.append(code_table)
-            story.append(Spacer(1, 8))
+            flow.append(Paragraph("Key concepts", st["h2"]))
+            items = [f"<b>{esc(c.get('name'))}</b>{(' — ' + esc(c.get('explanation'))) if c.get('explanation') else ''}" for c in concepts]
+            flow.append(ListFlowable([ListItem(Paragraph(i, st["body"]), leftIndent=10) for i in items], bulletType="bullet", start="•", leftIndent=12))
+        if notes.get("last_minute_notes"):
+            flow += [Paragraph("Last-minute notes", st["h2"]), PDFNotesGenerator._bullets(notes["last_minute_notes"], st["body"])]
+        if notes.get("code_example") and not compact:
+            code = esc(notes["code_example"]).replace("\n", "<br/>").replace("  ", "&nbsp;&nbsp;")
+            flow += [Paragraph("Code example", st["h2"]), Paragraph(code, st["code"])]
+        qas = notes.get("interview_questions") or []
+        if qas:
+            flow.append(Paragraph("Interview questions", st["h2"]))
+            for qa in qas:
+                flow.append(KeepTogether([Paragraph(f"<b>Q. {esc(qa.get('question'))}</b>", st["body"]),
+                                          Paragraph(f"A. {esc(qa.get('ideal_answer'))}", st["small"]), Spacer(1, 4)]))
+        if notes.get("common_pitfalls") and not compact:
+            flow += [Paragraph("Common pitfalls", st["h2"]), PDFNotesGenerator._bullets(notes["common_pitfalls"], st["body"])]
+        res = notes.get("resources") or {}
+        links = [f"Docs: {_link(d['url'], d['title'])}" for d in res.get("docs", [])] + \
+                [f"Video: {_link(v['url'], v['title'])}" for v in res.get("videos", [])]
+        if links:
+            flow += [Paragraph("Resources", st["h2"])] + [Paragraph(l, st["small"]) for l in links]
+        return flow
 
-        # 7. Real-World Industry Use Cases
-        use_cases = notes_data.get("industry_use_cases", [])
-        if use_cases:
-            story.append(Paragraph("6. High-Scale Production & FAANG Industry Applications", h1_style))
-            for uc in use_cases:
-                comp = safe_xml(uc.get("company", "Tech Enterprise"))
-                desc = safe_xml(uc.get("use_case", ""))
-                impact = safe_xml(uc.get("architecture_impact", ""))
-                story.append(Paragraph(f"<b>🏢 {comp}:</b> {desc} <i>(Impact: {impact})</i>", body_style))
-            story.append(Spacer(1, 4))
-            
-        # 8. Placement Interview Questions & Answers
-        questions = notes_data.get("interview_questions", [])
-        if questions:
-            story.append(Paragraph("7. Top Technical Screening & FAANG Placement Questions", h1_style))
-            for idx, qa in enumerate(questions, 1):
-                q = safe_xml(qa.get("question", ""))
-                ans = safe_xml(qa.get("ideal_answer", ""))
-                diff = safe_xml(qa.get("difficulty", "Medium"))
-                
-                story.append(Paragraph(f"<b>Q{idx} ({diff}):</b> {q}", qa_q_style))
-                story.append(Paragraph(f"<b>Ideal Model Answer:</b> {ans}", qa_a_style))
-            story.append(Spacer(1, 4))
-            
-        # 9. Traps, Pitfalls & Best Practices
-        pitfalls = notes_data.get("common_pitfalls", [])
-        practices = notes_data.get("best_practices", [])
-        if pitfalls or practices:
-            story.append(Paragraph("8. Common Traps, Antipatterns & Production Best Practices", h1_style))
-            for p in pitfalls:
-                story.append(Paragraph(f"<b>⚠️ Trap:</b> {safe_xml(p)}", body_style))
-            for pr in practices:
-                story.append(Paragraph(f"<b>✓ Best Practice:</b> {safe_xml(pr)}", body_style))
-            story.append(Spacer(1, 4))
-            
-        # 10. Executive Summary & Revision Box
-        final_summary = notes_data.get("summary", "Master fundamental definitions, space/time complexities, and production code before interviews.")
-        story.append(Paragraph("9. Key Takeaways & Fast Revision Summary", h1_style))
-        summary_p = Paragraph(safe_xml(final_summary), body_style)
-        
-        sum_table = Table([[summary_p]], colWidths=[530])
-        sum_table.setStyle(TableStyle([
-            ('BACKGROUND', (0,0), (-1,-1), colors.HexColor("#e0e7ff")), # Soft Indigo
-            ('TOPPADDING', (0,0), (-1,-1), 8),
-            ('BOTTOMPADDING', (0,0), (-1,-1), 8),
-            ('LEFTPADDING', (0,0), (-1,-1), 10),
-            ('RIGHTPADDING', (0,0), (-1,-1), 10),
-            ('BOX', (0,0), (-1,-1), 1, colors.HexColor("#c7d2fe")),
-        ]))
-        story.append(sum_table)
-        
-        # Build document
-        doc.build(story)
+    @staticmethod
+    def _doc(buffer: io.BytesIO, title: str) -> SimpleDocTemplate:
+        return SimpleDocTemplate(buffer, pagesize=A4, leftMargin=18 * mm, rightMargin=18 * mm, topMargin=16 * mm, bottomMargin=16 * mm,
+                                 title=title, author="GapX AI")
+
+    @staticmethod
+    def _footer(canvas, doc):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 7.5)
+        canvas.setFillColor(colors.HexColor("#9ca3af"))
+        canvas.drawString(18 * mm, 9 * mm, "GapX AI · Placement preparation notes")
+        canvas.drawRightString(A4[0] - 18 * mm, 9 * mm, f"Page {doc.page}")
+        canvas.restoreState()
+
+    @staticmethod
+    def generate_notes_pdf(notes: Dict[str, Any]) -> io.BytesIO:
+        buffer = io.BytesIO()
+        st = PDFNotesGenerator._styles()
+        story = [Paragraph(esc(notes.get("title", "Study Notes")), st["title"]),
+                 Paragraph(esc(f"{notes.get('stage', '')} · {notes.get('role', '')}"), st["meta"]),
+                 HRFlowable(width="100%", thickness=0.8, color=colors.HexColor("#c7d2fe"), spaceAfter=4)]
+        story += PDFNotesGenerator._topic_flowables(notes, st)
+        doc = PDFNotesGenerator._doc(buffer, notes.get("title", "Study Notes"))
+        doc.build(story, onFirstPage=PDFNotesGenerator._footer, onLaterPages=PDFNotesGenerator._footer)
+        buffer.seek(0)
+        return buffer
+
+    @staticmethod
+    def generate_cheatsheet_pdf(role: str, topics: List[Dict[str, Any]]) -> io.BytesIO:
+        buffer = io.BytesIO()
+        st = PDFNotesGenerator._styles()
+        story = [Paragraph(esc(f"{role}: Last-Minute Revision Notes"), st["title"]),
+                 Paragraph(f"{len(topics)} topics · concepts, revision bullets, interview questions and video links", st["meta"]),
+                 HRFlowable(width="100%", thickness=0.8, color=colors.HexColor("#c7d2fe"), spaceAfter=6)]
+        current_stage = None
+        for notes in topics:
+            if notes.get("stage") != current_stage:
+                current_stage = notes.get("stage")
+                story.append(Paragraph(esc(current_stage), st["stage"]))
+            story.append(Paragraph(esc(notes.get("title")), st["topic"]))
+            story += PDFNotesGenerator._topic_flowables(notes, st, compact=True)
+            story.append(HRFlowable(width="100%", thickness=0.4, color=colors.HexColor("#e5e7eb"), spaceBefore=6, spaceAfter=2))
+        doc = PDFNotesGenerator._doc(buffer, f"{role} Last-Minute Notes")
+        doc.build(story, onFirstPage=PDFNotesGenerator._footer, onLaterPages=PDFNotesGenerator._footer)
         buffer.seek(0)
         return buffer
 
 
+# ═══════════════════════════ RESUME ═══════════════════════════
 class PDFResumeGenerator:
-    """Generates an industry-standard, ATS-optimized single/two-page PDF resume."""
+    """One-column, A4, ATS-friendly resume.
+
+    ATS rules followed: single column, real selectable text, standard section headings,
+    no tables/images/icons for content, consistent dates, and clickable profile links.
+    """
+
+    SECTION_ORDER_FRESHER = ["summary", "education", "skills", "projects", "experience", "certifications", "achievements", "interests"]
+    SECTION_ORDER_EXPERIENCED = ["summary", "skills", "experience", "projects", "education", "certifications", "achievements", "interests"]
+
+    @staticmethod
+    def _styles():
+        base = getSampleStyleSheet()
+        ink, muted = colors.HexColor("#111827"), colors.HexColor("#374151")
+        return {
+            "name": ParagraphStyle("RName", parent=base["Title"], fontName="Helvetica-Bold", fontSize=19, leading=23, textColor=ink, alignment=TA_CENTER, spaceAfter=1),
+            "headline": ParagraphStyle("RHead", parent=base["Normal"], fontName="Helvetica", fontSize=10.5, leading=13, textColor=muted, alignment=TA_CENTER, spaceAfter=3),
+            "contact": ParagraphStyle("RContact", parent=base["Normal"], fontName="Helvetica", fontSize=8.8, leading=12, textColor=muted, alignment=TA_CENTER),
+            "section": ParagraphStyle("RSection", parent=base["Heading2"], fontName="Helvetica-Bold", fontSize=10.5, leading=13, textColor=ink, spaceBefore=8, spaceAfter=1, keepWithNext=True),
+            "item": ParagraphStyle("RItem", parent=base["Normal"], fontName="Helvetica-Bold", fontSize=9.8, leading=12.5, textColor=ink),
+            "sub": ParagraphStyle("RSub", parent=base["Normal"], fontName="Helvetica-Oblique", fontSize=9, leading=11.5, textColor=muted),
+            "date": ParagraphStyle("RDate", parent=base["Normal"], fontName="Helvetica", fontSize=9, leading=12.5, textColor=muted, alignment=2),
+            "body": ParagraphStyle("RBody", parent=base["Normal"], fontName="Helvetica", fontSize=9.3, leading=12.6, textColor=ink),
+            "bullet": ParagraphStyle("RBullet", parent=base["Normal"], fontName="Helvetica", fontSize=9.2, leading=12.2, textColor=ink),
+        }
+
+    @staticmethod
+    def _rule():
+        return HRFlowable(width="100%", thickness=0.7, color=colors.HexColor("#111827"), spaceBefore=1, spaceAfter=4)
+
+    @staticmethod
+    def _row(left: str, right: str, st) -> Table:
+        """Title on the left, dates on the right (a layout-only table ATS parsers read left to right)."""
+        width = A4[0] - 32 * mm - 12  # frame width (page minus margins and frame padding)
+        t = Table([[Paragraph(left, st["item"]), Paragraph(esc(right), st["date"])]], colWidths=[width * 0.72, width * 0.28])
+        t.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                               ("RIGHTPADDING", (0, 0), (-1, -1), 0), ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]))
+        return t
+
+    @staticmethod
+    def _bullets(lines: List[str], st) -> list:
+        lines = [l for l in lines if l]
+        if not lines:
+            return []
+        return [ListFlowable([ListItem(Paragraph(esc(l), st["bullet"]), leftIndent=9) for l in lines],
+                             bulletType="bullet", start="•", leftIndent=11, bulletFontSize=8, spaceBefore=1)]
 
     @staticmethod
     def generate_resume_pdf(data: Dict[str, Any]) -> io.BytesIO:
+        st = PDFResumeGenerator._styles()
         buffer = io.BytesIO()
-
-        doc = SimpleDocTemplate(
-            buffer,
-            pagesize=letter,
-            rightMargin=36,
-            leftMargin=36,
-            topMargin=36,
-            bottomMargin=36
-        )
-
-        styles = getSampleStyleSheet()
-
-        def safe_text(val: Any) -> str:
-            if val is None:
-                return ""
-            return str(val).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-
-        # Standard ATS Typography & Colors
-        name_style = ParagraphStyle(
-            name="ResumeName",
-            parent=styles["Title"],
-            fontName="Helvetica-Bold",
-            fontSize=18,
-            leading=22,
-            textColor=colors.HexColor("#0f172a"),
-            alignment=1, # Centered
-            spaceAfter=3
-        )
-
-        headline_style = ParagraphStyle(
-            name="ResumeHeadline",
-            parent=styles["Normal"],
-            fontName="Helvetica-Bold",
-            fontSize=10,
-            leading=13,
-            textColor=colors.HexColor("#4338ca"),
-            alignment=1,
-            spaceAfter=4
-        )
-
-        contact_style = ParagraphStyle(
-            name="ResumeContact",
-            parent=styles["Normal"],
-            fontName="Helvetica",
-            fontSize=8.5,
-            leading=11,
-            textColor=colors.HexColor("#334155"),
-            alignment=1,
-            spaceAfter=8
-        )
-
-        section_heading_style = ParagraphStyle(
-            name="ResumeSectionHeading",
-            parent=styles["Heading2"],
-            fontName="Helvetica-Bold",
-            fontSize=11,
-            leading=14,
-            textColor=colors.HexColor("#1e1b4b"),
-            spaceBefore=8,
-            spaceAfter=2,
-            keepWithNext=True
-        )
-
-        item_title_style = ParagraphStyle(
-            name="ResumeItemTitle",
-            parent=styles["Normal"],
-            fontName="Helvetica-Bold",
-            fontSize=9.5,
-            leading=12,
-            textColor=colors.HexColor("#0f172a")
-        )
-
-        item_sub_style = ParagraphStyle(
-            name="ResumeItemSub",
-            parent=styles["Normal"],
-            fontName="Helvetica",
-            fontSize=8.5,
-            leading=11,
-            textColor=colors.HexColor("#475569")
-        )
-
-        date_style = ParagraphStyle(
-            name="ResumeDate",
-            parent=styles["Normal"],
-            fontName="Helvetica-Bold",
-            fontSize=8.5,
-            leading=11,
-            textColor=colors.HexColor("#334155"),
-            alignment=2 # Right
-        )
-
-        bullet_style = ParagraphStyle(
-            name="ResumeBullet",
-            parent=styles["Normal"],
-            fontName="Helvetica",
-            fontSize=8.5,
-            leading=11.5,
-            textColor=colors.HexColor("#1e293b"),
-            leftIndent=12,
-            firstLineIndent=-8,
-            spaceAfter=1.5
-        )
-
-        body_style = ParagraphStyle(
-            name="ResumeBody",
-            parent=styles["Normal"],
-            fontName="Helvetica",
-            fontSize=8.5,
-            leading=12,
-            textColor=colors.HexColor("#1e293b"),
-            spaceAfter=4
-        )
-
-        story = []
-
-        # 1. Header (Name, Headline, Contact details)
         name = data.get("name") or data.get("full_name") or "Candidate Name"
-        story.append(Paragraph(safe_text(name), name_style))
+        doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=16 * mm, rightMargin=16 * mm, topMargin=13 * mm, bottomMargin=13 * mm,
+                                title=f"{name} - Resume", author=name, subject=data.get("headline") or "Resume")
+        story = [Paragraph(esc(name), st["name"])]
+        if data.get("headline"):
+            story.append(Paragraph(esc(data["headline"]), st["headline"]))
 
-        headline = data.get("headline") or data.get("target_role") or "Software Engineer"
-        story.append(Paragraph(safe_text(headline), headline_style))
+        contact = [esc(x) for x in (data.get("phone"), data.get("email"), data.get("location")) if x]
+        contact += [_link(data[k]) for k in ("linkedin", "github", "portfolio") if data.get(k)]
+        if contact:
+            story.append(Paragraph("  |  ".join(contact), st["contact"]))
+        story.append(Spacer(1, 3))
 
-        contact_parts = []
-        if data.get("email"):
-            contact_parts.append(safe_text(data["email"]))
-        if data.get("phone"):
-            contact_parts.append(safe_text(data["phone"]))
-        if data.get("location"):
-            contact_parts.append(safe_text(data["location"]))
-        if data.get("linkedin"):
-            contact_parts.append(f"<b>LinkedIn:</b> {safe_text(data['linkedin'])}")
-        if data.get("github"):
-            contact_parts.append(f"<b>GitHub:</b> {safe_text(data['github'])}")
-        if data.get("portfolio"):
-            contact_parts.append(f"<b>Portfolio:</b> {safe_text(data['portfolio'])}")
+        def section(title: str, flowables: list):
+            if flowables:
+                story.append(KeepTogether([Paragraph(title.upper(), st["section"]), PDFResumeGenerator._rule(), flowables[0]]))
+                story.extend(flowables[1:])
 
-        if contact_parts:
-            story.append(Paragraph(" • ".join(contact_parts), contact_style))
+        builders = {
+            "summary": lambda: [Paragraph(esc(data["summary"]), st["body"])] if data.get("summary") else [],
+            "skills": lambda: PDFResumeGenerator._skills(data, st),
+            "experience": lambda: PDFResumeGenerator._experience(data, st),
+            "projects": lambda: PDFResumeGenerator._projects(data, st),
+            "education": lambda: PDFResumeGenerator._education(data, st),
+            "certifications": lambda: PDFResumeGenerator._bullets(_as_list(data.get("certifications")), st),
+            "achievements": lambda: PDFResumeGenerator._bullets(_as_list(data.get("achievements")) + _as_list(data.get("hackathons")), st),
+            "interests": lambda: [Paragraph(esc(", ".join(_as_list(data.get("interests")))), st["body"])] if _as_list(data.get("interests")) else [],
+        }
+        titles = {"summary": "Professional Summary", "skills": "Technical Skills", "experience": "Experience", "projects": "Projects",
+                  "education": "Education", "certifications": "Certifications", "achievements": "Achievements", "interests": "Interests"}
+        has_experience = bool(data.get("experience") or data.get("internships"))
+        order = PDFResumeGenerator.SECTION_ORDER_EXPERIENCED if has_experience and not data.get("is_fresher", False) else PDFResumeGenerator.SECTION_ORDER_FRESHER
+        for key in order:
+            section(titles[key], builders[key]())
 
-        def add_section_header(title: str):
-            story.append(Spacer(1, 4))
-            story.append(Paragraph(title.upper(), section_heading_style))
-            story.append(HRFlowable(width="100%", thickness=0.75, color=colors.HexColor("#cbd5e1"), spaceBefore=1, spaceAfter=4))
-
-        # 2. Professional Summary
-        summary = data.get("summary") or data.get("objective")
-        if summary:
-            add_section_header("Professional Summary")
-            story.append(Paragraph(safe_text(summary), body_style))
-
-        # 3. Education
-        add_section_header("Education")
-        education_list = data.get("education_items")
-        if education_list and isinstance(education_list, list):
-            for edu in education_list:
-                deg = safe_text(edu.get("degree", "Bachelor of Technology in Computer Science"))
-                inst = safe_text(edu.get("institution", "University"))
-                dates = safe_text(edu.get("dates", "2022 - 2026"))
-                cgpa = edu.get("cgpa")
-
-                edu_row = [[Paragraph(f"<b>{deg}</b> - {inst}", item_title_style), Paragraph(dates, date_style)]]
-                t = Table(edu_row, colWidths=[400, 140])
-                t.setStyle(TableStyle([('VALIGN', (0,0), (-1,-1), 'TOP'), ('BOTTOMPADDING', (0,0), (-1,-1), 1), ('TOPPADDING', (0,0), (-1,-1), 1)]))
-                story.append(t)
-                if cgpa:
-                    story.append(Paragraph(f"CGPA / Percentage: <b>{safe_text(cgpa)}</b>", item_sub_style))
-                story.append(Spacer(1, 2))
-        else:
-            edu_str = data.get("education") or "Bachelor of Technology in Computer Science"
-            sem_str = data.get("semester") or ""
-            cgpa_val = data.get("cgpa")
-            row = [[Paragraph(f"<b>{safe_text(edu_str)}</b>", item_title_style), Paragraph(safe_text(sem_str or "2022 - 2026"), date_style)]]
-            t = Table(row, colWidths=[400, 140])
-            t.setStyle(TableStyle([('VALIGN', (0,0), (-1,-1), 'TOP'), ('BOTTOMPADDING', (0,0), (-1,-1), 1), ('TOPPADDING', (0,0), (-1,-1), 1)]))
-            story.append(t)
-            if cgpa_val:
-                story.append(Paragraph(f"Cumulative GPA: <b>{safe_text(cgpa_val)}</b>", item_sub_style))
-
-        # 4. Technical Skills
-        add_section_header("Technical Skills")
-        skills = data.get("skills") or []
-        languages = data.get("languages") or data.get("languages_known") or []
-        tools = data.get("tools") or data.get("frameworks") or []
-
-        if isinstance(skills, str):
-            skills = [s.strip() for s in skills.split(",") if s.strip()]
-        if isinstance(languages, str):
-            languages = [l.strip() for l in languages.split(",") if l.strip()]
-        if isinstance(tools, str):
-            tools = [t.strip() for t in tools.split(",") if t.strip()]
-
-        if languages:
-            story.append(Paragraph(f"<b>Languages:</b> {safe_text(', '.join(languages))}", bullet_style))
-        if skills:
-            story.append(Paragraph(f"<b>Core Technologies &amp; Frameworks:</b> {safe_text(', '.join(skills))}", bullet_style))
-        if tools:
-            story.append(Paragraph(f"<b>Developer Tools &amp; Cloud:</b> {safe_text(', '.join(tools))}", bullet_style))
-        if not (languages or skills or tools):
-            story.append(Paragraph("<b>Technologies:</b> Python, JavaScript, TypeScript, React, Next.js, Node.js, PostgreSQL, Docker, Git, DSA, System Design", bullet_style))
-
-        # 5. Experience / Internships
-        exp_list = data.get("experience") or data.get("internships")
-        if exp_list and isinstance(exp_list, list) and len(exp_list) > 0:
-            add_section_header("Work Experience & Internships")
-            for exp in exp_list:
-                title = safe_text(exp.get("title") or exp.get("role") or "Software Engineering Intern")
-                company = safe_text(exp.get("company") or "Tech Enterprise")
-                dates = safe_text(exp.get("dates") or exp.get("duration") or "May 2024 - July 2024")
-                loc = safe_text(exp.get("location") or "")
-
-                comp_loc = f"{company}" + (f" | {loc}" if loc else "")
-                row = [[Paragraph(f"<b>{title}</b> — {comp_loc}", item_title_style), Paragraph(dates, date_style)]]
-                t = Table(row, colWidths=[400, 140])
-                t.setStyle(TableStyle([('VALIGN', (0,0), (-1,-1), 'TOP'), ('BOTTOMPADDING', (0,0), (-1,-1), 1), ('TOPPADDING', (0,0), (-1,-1), 1)]))
-                story.append(t)
-
-                bullets = exp.get("bullets") or exp.get("description")
-                if isinstance(bullets, list):
-                    for b in bullets:
-                        story.append(Paragraph(f"• {safe_text(b)}", bullet_style))
-                elif isinstance(bullets, str) and bullets.strip():
-                    story.append(Paragraph(f"• {safe_text(bullets)}", bullet_style))
-                story.append(Spacer(1, 3))
-
-        # 6. Key Projects
-        projects_list = data.get("projects")
-        if projects_list and isinstance(projects_list, list) and len(projects_list) > 0:
-            add_section_header("Key Technical Projects")
-            for proj in projects_list:
-                pname = safe_text(proj.get("title") or proj.get("name") or "Project Name")
-                pstack = safe_text(proj.get("stack") or proj.get("technologies") or "")
-                plink = safe_text(proj.get("link") or proj.get("github") or "")
-
-                title_part = f"<b>{pname}</b>" + (f" | <i>{pstack}</i>" if pstack else "")
-                row = [[Paragraph(title_part, item_title_style), Paragraph(plink, date_style)]]
-                t = Table(row, colWidths=[380, 160])
-                t.setStyle(TableStyle([('VALIGN', (0,0), (-1,-1), 'TOP'), ('BOTTOMPADDING', (0,0), (-1,-1), 1), ('TOPPADDING', (0,0), (-1,-1), 1)]))
-                story.append(t)
-
-                bullets = proj.get("bullets") or proj.get("description")
-                if isinstance(bullets, list):
-                    for b in bullets:
-                        story.append(Paragraph(f"• {safe_text(b)}", bullet_style))
-                elif isinstance(bullets, str) and bullets.strip():
-                    story.append(Paragraph(f"• {safe_text(bullets)}", bullet_style))
-                story.append(Spacer(1, 3))
-
-        # 7. Certifications & Achievements
-        certs = data.get("certifications") or []
-        achievements = data.get("achievements") or data.get("hackathons") or []
-        if isinstance(certs, str):
-            certs = [c.strip() for c in certs.split(",") if c.strip()]
-        if isinstance(achievements, str):
-            achievements = [a.strip() for a in achievements.split(",") if a.strip()]
-
-        if certs or achievements:
-            add_section_header("Certifications & Honors")
-            if certs:
-                for c in certs:
-                    story.append(Paragraph(f"• <b>Certification:</b> {safe_text(c)}", bullet_style))
-            if achievements:
-                for a in achievements:
-                    story.append(Paragraph(f"• <b>Honor / Award:</b> {safe_text(a)}", bullet_style))
-
-        # Build document
         doc.build(story)
         buffer.seek(0)
         return buffer
+
+    @staticmethod
+    def _skills(data: Dict[str, Any], st) -> list:
+        rows = [("Languages", _as_list(data.get("languages"))), ("Frameworks & Libraries", _as_list(data.get("frameworks"))),
+                ("Tools & Platforms", _as_list(data.get("tools"))), ("Core Skills", _as_list(data.get("skills")))]
+        seen, out = set(), []
+        for label, items in rows:
+            uniq = [i for i in items if i.lower() not in seen]
+            seen.update(i.lower() for i in uniq)
+            if uniq:
+                out.append(Paragraph(f"<b>{label}:</b> {esc(', '.join(uniq))}", st["body"]))
+        return out
+
+    @staticmethod
+    def _experience(data: Dict[str, Any], st) -> list:
+        out = []
+        for e in list(data.get("experience") or []) + list(data.get("internships") or []):
+            if not isinstance(e, dict):
+                continue
+            role, company = e.get("role") or e.get("title") or "", e.get("company") or e.get("organization") or ""
+            left = f"{esc(role)}{(' — ' + esc(company)) if company else ''}"
+            out.append(PDFResumeGenerator._row(left, e.get("dates") or e.get("duration") or "", st))
+            if e.get("location"):
+                out.append(Paragraph(esc(e["location"]), st["sub"]))
+            out += PDFResumeGenerator._bullets(_as_list(e.get("bullets") or e.get("description")), st)
+            out.append(Spacer(1, 4))
+        return out
+
+    @staticmethod
+    def _projects(data: Dict[str, Any], st) -> list:
+        out = []
+        for p in data.get("projects") or []:
+            if not isinstance(p, dict):
+                continue
+            title = p.get("name") or p.get("title") or "Project"
+            stack = p.get("stack") or p.get("technologies") or ""
+            left = f"{esc(title)}{(' | <font name=Helvetica-Oblique>' + esc(stack) + '</font>') if stack else ''}"
+            out.append(PDFResumeGenerator._row(left, p.get("dates") or "", st))
+            if p.get("link"):
+                out.append(Paragraph(_link(p["link"]), st["sub"]))
+            out += PDFResumeGenerator._bullets(_as_list(p.get("bullets") or p.get("description")), st)
+            out.append(Spacer(1, 4))
+        return out
+
+    @staticmethod
+    def _education(data: Dict[str, Any], st) -> list:
+        items = data.get("education_items") or []
+        if not items and data.get("education"):
+            items = [{"degree": data.get("education"), "institution": data.get("college"), "year": data.get("semester") or data.get("grad_year"), "cgpa": data.get("cgpa")}]
+        out = []
+        for ed in items:
+            if not isinstance(ed, dict):
+                continue
+            out.append(PDFResumeGenerator._row(esc(ed.get("degree") or ""), str(ed.get("year") or ""), st))
+            sub = ", ".join(x for x in [str(ed.get("institution") or ""), f"CGPA: {ed['cgpa']}" if ed.get("cgpa") else ""] if x)
+            if sub:
+                out.append(Paragraph(esc(sub), st["sub"]))
+            out.append(Spacer(1, 3))
+        return out
 
 
 class PDFExtractor:

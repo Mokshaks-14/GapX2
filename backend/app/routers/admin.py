@@ -2,18 +2,12 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from app import models, schemas
 from app.core.database import get_db
-from app.core.security import get_current_user
+from app.core.security import get_admin_user
 from typing import Dict, Any, List
 
 router = APIRouter(prefix="/admin", tags=["Admin Control Panel"])
 
-def check_admin(user: models.User = Depends(get_current_user)):
-    is_admin_user = user.is_admin or (user.role and user.role.lower() == "admin") or user.email == "admin@gapx.ai" or user.email.startswith("admin")
-    if not is_admin_user:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied. Administrator privileges required."
-        )
+def check_admin(user: models.User = Depends(get_admin_user)):
     return user
 
 @router.get("/metrics")
@@ -37,6 +31,8 @@ def create_problem(
     db: Session = Depends(get_db),
     admin: models.User = Depends(check_admin)
 ):
+    if not payload.get("title") or not payload.get("problem_statement"):
+        raise HTTPException(status_code=400, detail="Title and problem statement are required.")
     db_problem = models.CodingProblem(
         title=payload.get("title"),
         difficulty=payload.get("difficulty", "Easy"),

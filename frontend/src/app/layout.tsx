@@ -2,18 +2,18 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "GapX AI - AI-Driven Skill Gap Intelligence Platform",
-  description: "Prepare students to become completely placement and industry-ready with personalized roadmaps, mock coding tests, and live AI interviews.",
+  title: "GapX AI - Skill Gap Intelligence Platform",
+  description: "Prepare to become placement and industry ready with personalised roadmaps, coding practice and live AI mock interviews.",
 };
 
-export default function RootLayout({
-  children,
-}: Readonly<{
-  children: React.ReactNode;
-}>) {
+// Applies the saved theme before first paint so there's no light/dark flash
+const themeScript = `(function(){try{var t=localStorage.getItem('gapx_theme')||'dark';var d=document.documentElement;d.classList.toggle('dark',t==='dark');d.classList.toggle('light',t==='light');}catch(e){}})();`;
+
+export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
-    <html lang="en" className="dark">
+    <html lang="en" className="dark" suppressHydrationWarning>
       <head>
+        <script dangerouslySetInnerHTML={{ __html: themeScript }} />
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
         <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet" />

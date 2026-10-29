@@ -1,282 +1,174 @@
-from fastapi import APIRouter, Depends, HTTPException, Response, Query, status
+import copy
+import re
+from datetime import datetime, timedelta
+from typing import Any, Dict
+
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
-from typing import Optional, Dict, Any
-from jose import jwt, JWTError
-import copy
+
 from app import models, schemas
 from app.core.database import get_db
 from app.core.security import get_current_user
-from app.core.config import settings
-from app.services.ai_service import AIService
+from app.services import roadmap_service
 from app.services.pdf_generator import PDFNotesGenerator
-from datetime import datetime, timedelta
+from app.services.gamification import record_activity
 
 router = APIRouter(prefix="/roadmaps", tags=["AI Roadmap Module"])
 
+
+def _latest(db: Session, user: models.User):
+    return db.query(models.Roadmap).filter(models.Roadmap.user_id == user.id)\
+        .order_by(models.Roadmap.created_at.desc()).first()
+
+
+def _estimate_completion(stages, hours_per_day: int) -> str:
+    total_hours = sum(t.get("estimated_hours", 4) for s in stages for t in s.get("topics", []) if not t.get("is_completed"))
+    days = max(7, round(total_hours / max(1, hours_per_day or 2)))
+    return (datetime.now() + timedelta(days=days)).strftime("%d %B, %Y")
+
+
 @router.post("/generate", response_model=schemas.RoadmapResponse)
-def generate_roadmap(
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user)
-):
+def generate_roadmap(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
     if not current_user.target_roles:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Please select target job roles first."
-        )
-        
-    primary_role = current_user.target_roles[0]
-    
-    # Generate roadmap stages using AI service
-    stages = AIService.generate_roadmap(
-        role=primary_role,
-        current_skills=current_user.skills or [],
-        experience=current_user.experience_level or "Beginner"
-    )
-    
-    # Ensure structured IDs and checkbox states (is_completed = False)
-    for s_idx, stage in enumerate(stages, 1):
-        if not stage.get("id"):
-            stage["id"] = s_idx
-        for t_idx, topic in enumerate(stage.get("topics", []), 1):
-            if not topic.get("id"):
-                topic["id"] = stage["id"] * 100 + t_idx
-            topic["is_completed"] = False
-            
-    # Calculate estimated completion date (e.g. 2 months from now)
-    est_date = (datetime.now() + timedelta(days=60)).strftime("%d %B, %Y")
-    
-    # Save/Overwrite user's roadmap for this role
-    db_roadmap = db.query(models.Roadmap)\
-        .filter(models.Roadmap.user_id == current_user.id, models.Roadmap.target_role == primary_role)\
-        .first()
-        
-    if db_roadmap:
-        db_roadmap.stages_data = copy.deepcopy(stages)
-        db_roadmap.progress_percentage = 0.0
-        db_roadmap.estimated_completion_date = est_date
-        flag_modified(db_roadmap, "stages_data")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Please select target job roles first.")
+    role = current_user.target_roles[0]
+    built = roadmap_service.build_roadmap(role, current_user.skills or [])
+    stages = built["stages"]
+
+    existing = _latest(db, current_user)
+    first_time = existing is None
+    if existing:
+        roadmap_service.carry_over_progress(existing.stages_data, stages)
+        existing.target_role = role
+        existing.stages_data = copy.deepcopy(stages)
+        existing.progress_percentage = roadmap_service.progress(stages)
+        existing.estimated_completion_date = _estimate_completion(stages, current_user.preferred_learning_hours)
+        flag_modified(existing, "stages_data")
+        roadmap = existing
     else:
-        db_roadmap = models.Roadmap(
-            user_id=current_user.id,
-            target_role=primary_role,
-            stages_data=copy.deepcopy(stages),
-            progress_percentage=0.0,
-            estimated_completion_date=est_date
+        roadmap = models.Roadmap(
+            user_id=current_user.id, target_role=role, stages_data=copy.deepcopy(stages),
+            progress_percentage=roadmap_service.progress(stages),
+            estimated_completion_date=_estimate_completion(stages, current_user.preferred_learning_hours),
         )
-        db.add(db_roadmap)
-        
-    # Award XP
-    current_user.xp += 100
-    current_user.level = max(1, (current_user.xp // 500) + 1)
-    notif = models.Notification(
-        user_id=current_user.id,
-        title="Custom AI Roadmap Generated! (+100 XP)",
-        message=f"We designed a personalized 8-Stage preparation path targeting the '{primary_role}' job role. Let's start learning!",
-        type="Roadmap"
-    )
-    db.add(notif)
-    
-    db.commit()
-    db.refresh(db_roadmap)
-    return db_roadmap
+        db.add(roadmap)
 
-@router.get("/current", response_model=schemas.RoadmapResponse)
-def get_current_roadmap(
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user)
-):
-    roadmap = db.query(models.Roadmap)\
-        .filter(models.Roadmap.user_id == current_user.id)\
-        .order_by(models.Roadmap.created_at.desc())\
-        .first()
-        
-    if not roadmap:
-        if current_user.target_roles:
-            return generate_roadmap(db, current_user)
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No roadmap generated yet. Complete onboarding first."
-        )
-    return roadmap
-
-@router.post("/toggle-topic", response_model=schemas.RoadmapResponse)
-def toggle_topic(
-    request: schemas.ToggleTopicRequest,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user)
-):
-    roadmap = db.query(models.Roadmap)\
-        .filter(models.Roadmap.user_id == current_user.id)\
-        .order_by(models.Roadmap.created_at.desc())\
-        .first()
-        
-    if not roadmap:
-        raise HTTPException(status_code=404, detail="Roadmap not found")
-        
-    stages = copy.deepcopy(roadmap.stages_data)
-    topic_found = False
-    
-    req_stage_str = str(request.stage_id).strip()
-    req_topic_str = str(request.topic_id).strip()
-    target_state = bool(request.is_completed)
-    
-    # 1. First pass: try matching both stage ID and topic ID
-    for stage in stages:
-        if str(stage.get("id")).strip() == req_stage_str:
-            for topic in stage.get("topics", []):
-                if str(topic.get("id")).strip() == req_topic_str:
-                    topic["is_completed"] = target_state
-                    topic_found = True
-                    break
-            if topic_found:
-                break
-                
-    # 2. Fallback pass: match topic ID across any stage
-    if not topic_found:
-        for stage in stages:
-            for topic in stage.get("topics", []):
-                if str(topic.get("id")).strip() == req_topic_str:
-                    topic["is_completed"] = target_state
-                    topic_found = True
-                    break
-            if topic_found:
-                break
-
-    # Recalculate progress percentage
-    total_topics = 0
-    completed_topics = 0
-    for s in stages:
-        for t in s.get("topics", []):
-            total_topics += 1
-            if t.get("is_completed", False):
-                completed_topics += 1
-                
-    if target_state:
-        current_user.xp += 50
-        new_level = (current_user.xp // 500) + 1
-        if new_level > current_user.level:
-            current_user.level = new_level
-            lvl_notif = models.Notification(
-                user_id=current_user.id,
-                title=f"LEVELED UP! Level {new_level}",
-                message=f"Congratulations! You reached Level {new_level} with {current_user.xp} XP. Keep coding!",
-                type="Achievement"
-            )
-            db.add(lvl_notif)
-    else:
-        current_user.xp = max(0, current_user.xp - 50)
-        current_user.level = max(1, (current_user.xp // 500) + 1)
-        
-    roadmap.stages_data = stages
-    roadmap.progress_percentage = round((completed_topics / max(1, total_topics)) * 100, 1) if total_topics > 0 else 0.0
-    flag_modified(roadmap, "stages_data")
-    
+    if first_time:  # XP only for the first roadmap, so regenerating can't be farmed
+        current_user.xp += 100
+        current_user.level = max(1, current_user.xp // 500 + 1)
+        db.add(models.Notification(
+            user_id=current_user.id, title="Roadmap Ready! (+100 XP)", type="Roadmap",
+            message=f"Your {len(stages)}-stage {built['track_label']} roadmap is ready, with notes and video links for every topic.",
+        ))
     db.commit()
     db.refresh(roadmap)
     return roadmap
 
+
+@router.get("/current", response_model=schemas.RoadmapResponse)
+def get_current_roadmap(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    roadmap = _latest(db, current_user)
+    if not roadmap:
+        if current_user.target_roles:
+            return generate_roadmap(db, current_user)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No roadmap generated yet. Complete onboarding first.")
+    # Upgrade roadmaps created by older versions, keeping completed topics
+    if not roadmap_service.is_current_format(roadmap.stages_data or []):
+        built = roadmap_service.build_roadmap(roadmap.target_role, current_user.skills or [])
+        roadmap_service.carry_over_progress(roadmap.stages_data, built["stages"])
+        roadmap.stages_data = built["stages"]
+        roadmap.progress_percentage = roadmap_service.progress(built["stages"])
+        flag_modified(roadmap, "stages_data")
+        db.commit()
+        db.refresh(roadmap)
+    return roadmap
+
+
+@router.post("/toggle-topic", response_model=schemas.RoadmapResponse)
+def toggle_topic(request: schemas.ToggleTopicRequest, db: Session = Depends(get_db),
+                 current_user: models.User = Depends(get_current_user)):
+    roadmap = _latest(db, current_user)
+    if not roadmap:
+        raise HTTPException(status_code=404, detail="Roadmap not found")
+
+    stages = copy.deepcopy(roadmap.stages_data)
+    target = None
+    for stage in stages:
+        for topic in stage.get("topics", []):
+            if str(topic.get("id")) == str(request.topic_id) and (target is None or str(stage.get("id")) == str(request.stage_id)):
+                target = topic
+    if target is None:
+        raise HTTPException(status_code=404, detail="Topic not found")
+
+    new_state = bool(request.is_completed)
+    if bool(target.get("is_completed")) != new_state:  # only award/remove XP on a real change
+        target["is_completed"] = new_state
+        if new_state:
+            record_activity(current_user)
+            current_user.xp += 50
+            new_level = current_user.xp // 500 + 1
+            if new_level > current_user.level:
+                current_user.level = new_level
+                db.add(models.Notification(user_id=current_user.id, title=f"Level Up! Level {new_level}", type="Achievement",
+                                           message=f"You reached Level {new_level} with {current_user.xp} XP. Keep going!"))
+        else:
+            current_user.xp = max(0, current_user.xp - 50)
+            current_user.level = max(1, current_user.xp // 500 + 1)
+
+    roadmap.stages_data = stages
+    roadmap.progress_percentage = roadmap_service.progress(stages)
+    flag_modified(roadmap, "stages_data")
+    db.commit()
+    db.refresh(roadmap)
+    return roadmap
+
+
+def _find_topic(roadmap, stage_id: str, topic_id: str):
+    stage_title, topic_title = f"Stage {stage_id}", f"Topic {topic_id}"
+    for s in (roadmap.stages_data if roadmap else []) or []:
+        for t in s.get("topics", []):
+            if str(t.get("id")) == str(topic_id):
+                topic_title, stage_title = t.get("title", topic_title), s.get("title", stage_title)
+                if str(s.get("id")) == str(stage_id):
+                    return stage_title, topic_title
+    return stage_title, topic_title
+
+
 @router.get("/notes/{stage_id}/{topic_id}")
-def get_topic_notes(
-    stage_id: str,
-    topic_id: str,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user)
-) -> Dict[str, Any]:
-    """Returns structured JSON study notes for in-app reading."""
-    roadmap = db.query(models.Roadmap)\
-        .filter(models.Roadmap.user_id == current_user.id)\
-        .order_by(models.Roadmap.created_at.desc())\
-        .first()
-        
-    stage_title = f"Stage {stage_id}"
-    topic_title = f"Topic {topic_id}"
-    target_role = roadmap.target_role if roadmap else (current_user.target_roles[0] if current_user.target_roles else "Software Engineer")
-    
-    if roadmap and roadmap.stages_data:
-        for s in roadmap.stages_data:
-            if str(s.get("id")).strip() == str(stage_id).strip():
-                stage_title = s.get("title", stage_title)
-                for t in s.get("topics", []):
-                    if str(t.get("id")).strip() == str(topic_id).strip():
-                        topic_title = t.get("title", topic_title)
-                        break
-            # Also check across all topics if stage didn't match
-            for t in s.get("topics", []):
-                if str(t.get("id")).strip() == str(topic_id).strip():
-                    topic_title = t.get("title", topic_title)
-                    stage_title = s.get("title", stage_title)
-                    break
-                        
-    notes = AIService.generate_topic_notes(
-        topic_title=topic_title,
-        stage_title=stage_title,
-        role=target_role
-    )
-    return notes
+def get_topic_notes(stage_id: str, topic_id: str, db: Session = Depends(get_db),
+                    current_user: models.User = Depends(get_current_user)) -> Dict[str, Any]:
+    roadmap = _latest(db, current_user)
+    stage_title, topic_title = _find_topic(roadmap, stage_id, topic_id)
+    role = roadmap.target_role if roadmap else (current_user.target_roles or ["Software Engineer"])[0]
+    return roadmap_service.topic_notes(topic_title, stage_title, role)
+
+
+def _pdf_response(buffer, filename: str) -> Response:
+    return Response(content=buffer.getvalue(), media_type="application/pdf",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
 
 @router.get("/notes-pdf/{stage_id}/{topic_id}")
-def download_topic_notes(
-    stage_id: str,
-    topic_id: str,
-    token: Optional[str] = Query(None),
-    db: Session = Depends(get_db)
-):
-    """Compiles and streams a formatted academic ReportLab PDF of the topic study notes."""
-    user = None
-    if token:
-        try:
-            payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.ALGORITHM])
-            user_id = payload.get("sub")
-            if user_id:
-                user = db.query(models.User).filter(models.User.id == int(user_id)).first()
-        except Exception:
-            pass
-            
-    if not user:
-        user = db.query(models.User).first()
-        
-    if not user:
-        raise HTTPException(status_code=401, detail="User authentication required")
+def download_topic_notes(stage_id: str, topic_id: str, db: Session = Depends(get_db),
+                         current_user: models.User = Depends(get_current_user)):
+    roadmap = _latest(db, current_user)
+    stage_title, topic_title = _find_topic(roadmap, stage_id, topic_id)
+    role = roadmap.target_role if roadmap else (current_user.target_roles or ["Software Engineer"])[0]
+    notes = roadmap_service.topic_notes(topic_title, stage_title, role)
+    clean = re.sub(r"[^A-Za-z0-9]+", "_", topic_title).strip("_")
+    return _pdf_response(PDFNotesGenerator.generate_notes_pdf(notes), f"GapX_Notes_{clean}.pdf")
 
-    roadmap = db.query(models.Roadmap)\
-        .filter(models.Roadmap.user_id == user.id)\
-        .order_by(models.Roadmap.created_at.desc())\
-        .first()
-        
-    stage_title = f"Stage {stage_id}"
-    topic_title = f"Topic {topic_id}"
-    target_role = roadmap.target_role if roadmap else (user.target_roles[0] if user.target_roles else "Software Engineer")
-    
-    if roadmap and roadmap.stages_data:
-        for s in roadmap.stages_data:
-            if str(s.get("id")).strip() == str(stage_id).strip():
-                stage_title = s.get("title", stage_title)
-                for t in s.get("topics", []):
-                    if str(t.get("id")).strip() == str(topic_id).strip():
-                        topic_title = t.get("title", topic_title)
-                        break
-            for t in s.get("topics", []):
-                if str(t.get("id")).strip() == str(topic_id).strip():
-                    topic_title = t.get("title", topic_title)
-                    stage_title = s.get("title", stage_title)
-                    break
-                        
-    notes = AIService.generate_topic_notes(
-        topic_title=topic_title,
-        stage_title=stage_title,
-        role=target_role
-    )
-    
-    pdf_buffer = PDFNotesGenerator.generate_notes_pdf(notes)
-    
-    clean_filename = "".join([c if c.isalnum() else "_" for c in topic_title])
-    filename = f"GapX_AI_Notes_{clean_filename}.pdf"
-    
-    return Response(
-        content=pdf_buffer.getvalue(),
-        media_type="application/pdf",
-        headers={
-            "Content-Disposition": f"attachment; filename={filename}"
-        }
-    )
+
+@router.get("/cheatsheet-pdf")
+def download_roadmap_cheatsheet(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    """All last-minute notes for the user's roadmap in one PDF."""
+    roadmap = _latest(db, current_user)
+    if not roadmap:
+        raise HTTPException(status_code=404, detail="Generate a roadmap first.")
+    notes = roadmap_service.all_notes(roadmap.stages_data or [], roadmap.target_role)
+    if not notes:
+        raise HTTPException(status_code=409, detail="Regenerate your roadmap to get downloadable notes.")
+    buffer = PDFNotesGenerator.generate_cheatsheet_pdf(roadmap.target_role, notes)
+    clean = re.sub(r"[^A-Za-z0-9]+", "_", roadmap.target_role).strip("_")
+    return _pdf_response(buffer, f"GapX_{clean}_Last_Minute_Notes.pdf")

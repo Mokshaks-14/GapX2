@@ -9,18 +9,34 @@ import {
   Download, Copy, X, Briefcase, GraduationCap, Globe, Check, Phone, Linkedin, Github,
   Search, HelpCircle, CheckCircle2, Terminal, SlidersHorizontal, History, Save, RotateCcw,
   Maximize2, ChevronDown, ChevronUp, Bug, Lightbulb, TrendingUp, Target, Activity, Zap, Compass, ArrowUpRight,
-  Volume2, VolumeX, MicOff, PhoneOff, Subtitles
+  Volume2, VolumeX, MicOff, PhoneOff, Subtitles, Sun, Moon, Youtube, PlayCircle, Pause, SkipForward, SkipBack, Wand2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import MonacoCodeEditor from './MonacoCodeEditor';
-import { INITIAL_PROBLEMS } from './problemsData';
+import GapXLogo from './GapXLogo';
+import ConceptPlayer from './ConceptPlayer';
+import { startFaceAnalysis, FaceMetrics } from './faceAnalysis';
 import {
   ResponsiveContainer, BarChart, Bar, Cell,
   PieChart, Pie, AreaChart, Area, LineChart, Line,
   XAxis, YAxis, CartesianGrid, Tooltip, Legend
 } from 'recharts';
 
-const BACKEND_URL = 'http://127.0.0.1:8000/api/v1';
+const BACKEND_URL = (process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000') + '/api/v1';
+const INITIAL_PROBLEMS: any[] = [];
+
+const INTERVIEW_TRACKS = [
+  { id: 'frontend', label: 'Frontend Engineer', icon: '🎨', sub: 'HTML/CSS, JS, React, performance' },
+  { id: 'backend', label: 'Backend Engineer', icon: '🛠️', sub: 'APIs, databases, caching, scale' },
+  { id: 'fullstack', label: 'Full Stack Engineer', icon: '🌐', sub: 'Web end to end, CORS, deploy' },
+  { id: 'sde', label: 'Software Engineer (SDE)', icon: '🧩', sub: 'DSA, OOP, OS, DBMS' },
+  { id: 'data_science', label: 'Data Scientist', icon: '📊', sub: 'Stats, ML, experiments' },
+  { id: 'ml', label: 'AI / ML Engineer', icon: '🤖', sub: 'Deep learning, LLMs, RAG' },
+  { id: 'devops', label: 'DevOps / Cloud', icon: '☁️', sub: 'CI/CD, Docker, Kubernetes' },
+  { id: 'mobile', label: 'Mobile Developer', icon: '📱', sub: 'Android, iOS, Flutter' },
+  { id: 'data_analyst', label: 'Data Analyst', icon: '📈', sub: 'SQL, BI, metrics' },
+  { id: 'security', label: 'Cybersecurity', icon: '🛡️', sub: 'OWASP, crypto, IR' },
+];
 
 type AppState = 'splash' | 'auth' | 'onboarding' | 'dashboard';
 type AuthMode = 'login' | 'register';
@@ -155,6 +171,7 @@ export default function GapXApp() {
   const [authMode, setAuthMode] = useState<AuthMode>('login');
   const [sidebarTab, setSidebarTab] = useState<SidebarTab>('overview');
   const [themeMode, setThemeMode] = useState<'dark' | 'light'>('dark');
+  const themeLoadedRef = useRef(false);
 
   // Auth
   const [email, setEmail] = useState('');
@@ -268,8 +285,14 @@ export default function GapXApp() {
     project1Link: '',
     project1Bullets: '',
     certifications: '',
-    achievements: ''
+    achievements: '',
+    interests: '',
+    project2Title: '',
+    project2Stack: '',
+    project2Link: '',
+    project2Bullets: ''
   });
+  const [summaryLoading, setSummaryLoading] = useState(false);
 
   // Automatically sync profile and onboarding data directly into resume builder
   const syncResumeWithProfile = useCallback((prof?: UserProfile | null, onboard?: typeof onboardData) => {
@@ -315,7 +338,17 @@ export default function GapXApp() {
   const [isAiSpeaking, setIsAiSpeaking] = useState(false);
   const [silenceCountdown, setSilenceCountdown] = useState<number | null>(null);
   const [audioLevel, setAudioLevel] = useState<number>(0);
-  const [telemetry, setTelemetry] = useState({ attention: 88, smile: 25, stress: 14, eye: 92 });
+  const [telemetry, setTelemetry] = useState({ attention: 0, smile: 0, stress: 0, eye: 0 });
+  const [faceStatus, setFaceStatus] = useState<'off' | 'loading' | 'active' | 'no-face' | 'unavailable'>('off');
+  const faceSamplesRef = useRef<FaceMetrics[]>([]);
+  const [interviewLength, setInterviewLength] = useState(8);
+  const [interviewPhase, setInterviewPhase] = useState('Introduction');
+  const [questionNumber, setQuestionNumber] = useState(1);
+  const [totalQuestions, setTotalQuestions] = useState(8);
+  const [questionKind, setQuestionKind] = useState('intro');
+  const [interviewTrackLabel, setInterviewTrackLabel] = useState('');
+  const [questionElapsed, setQuestionElapsed] = useState(0);
+  const questionStartRef = useRef<number>(Date.now());
   const speakingStartTimeRef = useRef<number | null>(null);
   const [meetingDrawerOpen, setMeetingDrawerOpen] = useState(false);
   const [subtitlesEnabled, setSubtitlesEnabled] = useState(true);
@@ -364,7 +397,7 @@ export default function GapXApp() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const webcamStreamRef = useRef<MediaStream | null>(null);
   const [experienceLevel, setExperienceLevel] = useState<string>('Fresher');
-  const [topicDomain, setTopicDomain] = useState<string>('AIML');
+  const [topicDomain, setTopicDomain] = useState<string>('');  // interview field/track id; '' = detect from role
   const [currentDifficulty, setCurrentDifficulty] = useState<'Easy' | 'Medium' | 'Hard'>('Easy');
   const [difficultyChange, setDifficultyChange] = useState<'decreased' | 'same' | 'increased'>('same');
 
@@ -374,16 +407,21 @@ export default function GapXApp() {
   const recognitionRef = useRef<any>(null);
   const [audioOutputEnabled, setAudioOutputEnabled] = useState(true);
 
-  // --- SPLASH + RESTORE SESSION ---
+  // --- SPLASH + RESTORE SESSION (token is verified with the server) ---
   useEffect(() => {
-    const t = setTimeout(() => {
-      const saved = localStorage.getItem('gapx_session');
-      if (saved) {
+    const t = setTimeout(async () => {
+      let saved: any = null;
+      try { saved = JSON.parse(localStorage.getItem('gapx_session') || 'null'); } catch (_) {}
+      try { localStorage.removeItem('gapx_users'); } catch (_) {}  // old offline accounts stored plain-text passwords
+      const tok: string | undefined = saved?.token;
+      if (tok && !tok.startsWith('local_')) {
         try {
-          const { token: tok, profile: prof } = JSON.parse(saved);
-          if (tok && prof) {
+          const r = await fetch(`${BACKEND_URL}/users/me`, { headers: { Authorization: `Bearer ${tok}` } });
+          if (r.ok) {
+            const prof = await r.json();
             setToken(tok);
             setUserProfile(prof);
+            saveSession(tok, prof);
             if (prof.email) setEmail(prof.email);
             if (prof.full_name) setFullName(prof.full_name);
             syncResumeWithProfile(prof);
@@ -391,15 +429,40 @@ export default function GapXApp() {
             fetchRoadmap(tok); fetchProblems(tok); fetchNotifications(tok); fetchResume(tok); fetchReadiness(tok); fetchInterview(tok);
             return;
           }
-        } catch (_) {}
+          if (r.status === 401) setErrorMessage('Your session has expired. Please sign in again.');
+        } catch (_) {
+          setErrorMessage(`Can't reach the GapX server at ${BACKEND_URL.replace('/api/v1', '')}. Start the backend (run_app.bat) and refresh.`);
+        }
       }
-      // If logged out or no session, show clean auth login page
+      localStorage.removeItem('gapx_session');
       setAppState('auth');
       setAuthMode('login');
-      setEmail('');
       setPassword('');
-    }, 2000);
+    }, 1900);
     return () => clearTimeout(t);
+  }, []);
+
+  // --- SIGN-IN OPTIONS (Google / demo) ---
+  const [authConfig, setAuthConfig] = useState<{ google_client_id: string | null; demo_login_enabled: boolean }>({ google_client_id: null, demo_login_enabled: false });
+  const googleBtnRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    fetch(`${BACKEND_URL}/auth/config`).then(r => r.ok ? r.json() : null).then(d => d && setAuthConfig(d)).catch(() => {});
+  }, []);
+
+  // --- SESSION EXPIRY: any 401 from the API signs the user out cleanly ---
+  const sessionExpiredRef = useRef<() => void>(() => {});
+  useEffect(() => {
+    const original = window.fetch;
+    window.fetch = async (...args: Parameters<typeof fetch>) => {
+      const res = await original(...args);
+      const target = args[0] as any;
+      const url = typeof target === 'string' ? target : (target?.url || String(target));
+      if (res.status === 401 && url.startsWith(BACKEND_URL) && !url.includes('/auth/')) {
+        sessionExpiredRef.current();
+      }
+      return res;
+    };
+    return () => { window.fetch = original; };
   }, []);
 
   // --- CODE AUTO-SAVE ENGINE (EVERY 15 SECONDS) ---
@@ -467,22 +530,59 @@ export default function GapXApp() {
 
   // --- THEME ---
   useEffect(() => {
+    if (!themeLoadedRef.current) {
+      themeLoadedRef.current = true;
+      try {
+        const stored = localStorage.getItem('gapx_theme');
+        if (stored === 'light' && themeMode !== 'light') { setThemeMode('light'); return; }
+      } catch (_) {}
+    }
     document.documentElement.classList.toggle('dark', themeMode === 'dark');
+    document.documentElement.classList.toggle('light', themeMode === 'light');
+    try { localStorage.setItem('gapx_theme', themeMode); } catch (_) {}
   }, [themeMode]);
 
-  // --- TELEMETRY SIMULATION (webcam & speech tracking) ---
+  // --- FACE ANALYSIS (MediaPipe in the browser; video never leaves the device) ---
   useEffect(() => {
-    if (!webcamEnabled) return;
-    const interval = setInterval(() => {
-      setTelemetry(prev => ({
-        attention: Math.min(Math.max(prev.attention + (Math.random() * 4 - 2), 65), 99),
-        smile: Math.min(Math.max(prev.smile + (Math.random() * 6 - 3), 10), 85),
-        stress: Math.min(Math.max(prev.stress + (Math.random() * 4 - 2), 8), 55),
-        eye: Math.min(Math.max(prev.eye + (Math.random() * 3 - 1.5), 70), 98),
-      }));
-    }, 1200);
-    return () => clearInterval(interval);
+    if (!webcamEnabled) { setFaceStatus('off'); return; }
+    let stop: (() => void) | null = null;
+    let cancelled = false;
+    const begin = async () => {
+      const video = webcamRef.current;
+      if (!video) return;
+      setFaceStatus('loading');
+      try {
+        stop = await startFaceAnalysis(video, m => {
+          if (!m.facePresent) { setFaceStatus('no-face'); return; }
+          setFaceStatus('active');
+          faceSamplesRef.current.push(m);
+          if (faceSamplesRef.current.length > 600) faceSamplesRef.current.shift();
+          setTelemetry({ attention: m.attention * 100, smile: m.smile * 100, stress: m.stress * 100, eye: m.eyeContact * 100 });
+        });
+        if (cancelled && stop) stop();
+      } catch (_) {
+        if (!cancelled) setFaceStatus('unavailable');
+      }
+    };
+    const t = setTimeout(begin, 400);  // let the <video> attach the stream first
+    return () => { cancelled = true; clearTimeout(t); if (stop) stop(); };
   }, [webcamEnabled]);
+
+  // Time spent on the current question
+  useEffect(() => {
+    if (!interviewStarted) return;
+    const iv = setInterval(() => setQuestionElapsed(Math.floor((Date.now() - questionStartRef.current) / 1000)), 1000);
+    return () => clearInterval(iv);
+  }, [interviewStarted]);
+
+  // Averages the face metrics collected while the candidate answered the current question
+  const collectFaceMetrics = () => {
+    const samples = faceSamplesRef.current.filter(m => m.facePresent);
+    faceSamplesRef.current = [];
+    if (!webcamEnabled || samples.length < 3) return {};
+    const avg = (k: keyof FaceMetrics) => samples.reduce((a, m) => a + (m[k] as number), 0) / samples.length;
+    return { attention_metric: avg('attention'), smile_metric: avg('smile'), stress_metric: avg('stress'), eye_contact_metric: avg('eyeContact') };
+  };
 
   // Ensure video element plays webcam stream smoothly whenever webcam is active
   useEffect(() => {
@@ -551,11 +651,11 @@ export default function GapXApp() {
 
       ctx.fillStyle = '#10b981';
       ctx.font = 'bold 9px monospace';
-      ctx.fillText('● AI BIOMETRIC TRACKER: ON', m + 12, m + 18);
+      ctx.fillText(faceStatus === 'active' ? '● FACE ANALYSIS: ON' : faceStatus === 'loading' ? '○ LOADING FACE MODEL…' : faceStatus === 'no-face' ? '○ FACE NOT VISIBLE' : '○ FACE ANALYSIS OFF', m + 12, m + 18);
 
       ctx.fillStyle = 'rgba(255, 255, 255, 0.85)';
       ctx.font = '8px monospace';
-      ctx.fillText(`EYE GAZE: ${Math.round(telemetry.eye)}% · POISE: ${Math.round(100 - telemetry.stress)}%`, m + 12, m + 30);
+      ctx.fillText(faceStatus === 'active' ? `EYE CONTACT: ${Math.round(telemetry.eye)}% · COMPOSURE: ${Math.round(100 - telemetry.stress)}%` : 'METRICS: —', m + 12, m + 30);
       ctx.fillStyle = isRecording ? '#f87171' : 'rgba(161, 161, 170, 0.8)';
       ctx.fillText(isRecording ? '🎙️ VOICE DETECTED (SPEAKING)' : '● AWAITING SPEECH RESPONSE', m + 12, m + 40);
 
@@ -564,7 +664,7 @@ export default function GapXApp() {
 
     draw();
     return () => cancelAnimationFrame(raf);
-  }, [webcamEnabled, telemetry, isRecording]);
+  }, [webcamEnabled, telemetry, isRecording, faceStatus]);
 
   // --- API HELPERS ---
   const authHeaders = () => ({ 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' });
@@ -581,7 +681,7 @@ export default function GapXApp() {
       const r = await fetch(`${BACKEND_URL}/roadmaps/current`, { headers });
       if (r.ok) {
         const d = await r.json();
-        if (d && Array.isArray(d.stages_data) && d.stages_data.length >= 6) {
+        if (d && Array.isArray(d.stages_data) && d.stages_data.length > 0) {
           setRoadmap(d);
           return;
         }
@@ -589,14 +689,12 @@ export default function GapXApp() {
       const genR = await fetch(`${BACKEND_URL}/roadmaps/generate`, { method: 'POST', headers });
       if (genR.ok) {
         const d = await genR.json();
-        if (d && Array.isArray(d.stages_data) && d.stages_data.length >= 6) {
+        if (d && Array.isArray(d.stages_data) && d.stages_data.length > 0) {
           setRoadmap(d);
           return;
         }
       }
     } catch (_) {}
-    // Complete 8-Stage Roadmap fallback
-    setRoadmap(createMockRoadmap(targetRole));
   };
 
   const fetchProblems = async (tok: string) => {
@@ -662,8 +760,13 @@ export default function GapXApp() {
             project1Stack: rd.project1Stack || (rd.parsed_projects?.[0]?.stack) || prev.project1Stack,
             project1Link: rd.project1Link || prev.project1Link,
             project1Bullets: rd.project1Bullets || (rd.parsed_projects?.[0]?.description) || prev.project1Bullets,
-            certifications: rd.certifications || prev.certifications,
-            achievements: rd.achievements || prev.achievements
+            certifications: Array.isArray(rd.certifications) ? rd.certifications.join(', ') : (rd.certifications || prev.certifications),
+            achievements: Array.isArray(rd.achievements) ? rd.achievements.join(', ') : (rd.achievements || prev.achievements),
+            interests: Array.isArray(rd.interests) ? rd.interests.join(', ') : (rd.interests || prev.interests),
+            project2Title: rd.projects?.[1]?.name || prev.project2Title,
+            project2Stack: rd.projects?.[1]?.stack || prev.project2Stack,
+            project2Link: rd.projects?.[1]?.link || prev.project2Link,
+            project2Bullets: Array.isArray(rd.projects?.[1]?.bullets) ? rd.projects[1].bullets.join('\n') : prev.project2Bullets
           }));
         }
       }
@@ -689,118 +792,6 @@ export default function GapXApp() {
   };
 
   // --- MOCK DATA (High quality 8-stage roadmap fallback) ---
-  const createMockRoadmap = (targetRole: string = 'Software Engineer') => {
-    const roleLower = (targetRole || '').toLowerCase();
-    let specTitle = `Core Backend & API Architecture (${targetRole})`;
-    let specDesc = `Deep dive into production runtime engines, REST/gRPC APIs, microservices, and database ORMs for ${targetRole}.`;
-    let topic51 = { id: 501, title: 'RESTful API & gRPC Microservice Specs', description: 'HTTP/2, protocol buffers, OpenAPI, middleware, authentication, and rate limiting.', estimated_hours: 8, difficulty: 'Medium', is_completed: false, resources: [{ type: 'Documentation', title: 'REST API Specs', url: 'https://restfulapi.net' }] };
-    let topic52 = { id: 502, title: 'Async Workers, Celery & Message Queues', description: 'RabbitMQ, Kafka event streams, Redis pub/sub, background workers, and idempotency.', estimated_hours: 10, difficulty: 'Hard', is_completed: false, resources: [] };
-    let sysTitle = 'Distributed Systems & System Design';
-    let topic61 = { id: 601, title: 'Database Sharding, Replication & Caching', description: 'Master-slave replication, consistent hashing, Redis LRU, and read/write splitting.', estimated_hours: 10, difficulty: 'Hard', is_completed: false, resources: [] };
-    let topic62 = { id: 602, title: 'High Availability & Fault Tolerant Systems', description: 'Circuit breakers, rate limiters, consensus protocols (Raft/Paxos), and CDN edge caching.', estimated_hours: 12, difficulty: 'Hard', is_completed: false, resources: [] };
-
-    if (roleLower.includes('frontend') || roleLower.includes('react') || roleLower.includes('web')) {
-      specTitle = 'Modern Frontend Architecture';
-      specDesc = 'Master React, Next.js, State Management, CSS Architecture, and Web Vitals.';
-      topic51 = { id: 501, title: 'React Core & Hooks Deep Dive', description: 'Virtual DOM, useEffect, useMemo, custom hooks, and component lifecycle.', estimated_hours: 8, difficulty: 'Medium', is_completed: false, resources: [{ type: 'Documentation', title: 'React Docs', url: 'https://react.dev' }] };
-      topic52 = { id: 502, title: 'State Management & Next.js SSR/SSG', description: 'Redux Toolkit, Zustand, Server Components, and App Router architecture.', estimated_hours: 10, difficulty: 'Hard', is_completed: false, resources: [{ type: 'Documentation', title: 'Next.js Docs', url: 'https://nextjs.org' }] };
-      sysTitle = 'Frontend System Design & Optimization';
-      topic61 = { id: 601, title: 'Web Vitals & Performance Tuning', description: 'LCP, FID, CLS, code splitting, lazy loading, and asset optimization.', estimated_hours: 8, difficulty: 'Medium', is_completed: false, resources: [] };
-      topic62 = { id: 602, title: 'Micro-Frontends & Design Systems', description: 'Module Federation, Tailwind CSS design tokens, and accessibility (a11y).', estimated_hours: 10, difficulty: 'Hard', is_completed: false, resources: [] };
-    } else if (roleLower.includes('data') || roleLower.includes('machine learning') || roleLower.includes('ai')) {
-      specTitle = 'Data Engineering & Machine Learning Pipelines';
-      specDesc = 'Build scalable data pipelines, ML models, feature engineering, and neural networks.';
-      topic51 = { id: 501, title: 'Pandas, NumPy & Exploratory Data Analysis', description: 'Data wrangling, matrix manipulation, feature scaling, and statistical distributions.', estimated_hours: 8, difficulty: 'Medium', is_completed: false, resources: [{ type: 'Documentation', title: 'Pandas Docs', url: 'https://pandas.pydata.org' }] };
-      topic52 = { id: 502, title: 'Supervised & Unsupervised ML Algorithms', description: 'Regression, Decision Trees, Random Forests, XGBoost, Clustering, and PCA.', estimated_hours: 12, difficulty: 'Hard', is_completed: false, resources: [] };
-      sysTitle = 'MLOps & Big Data Systems';
-      topic61 = { id: 601, title: 'PySpark & Big Data Processing', description: 'Distributed dataframes, RDDs, Hadoop ecosystem, and stream processing.', estimated_hours: 10, difficulty: 'Hard', is_completed: false, resources: [] };
-      topic62 = { id: 602, title: 'Model Deployment & MLOps Pipelines', description: 'FastAPI ML serving, MLflow tracking, Docker containerization, and monitoring drift.', estimated_hours: 10, difficulty: 'Hard', is_completed: false, resources: [] };
-    } else if (roleLower.includes('devops') || roleLower.includes('cloud')) {
-      specTitle = 'Cloud Infrastructure & Orchestration';
-      specDesc = 'Master AWS/GCP, Kubernetes, Terraform Infrastructure as Code, and CI/CD automation.';
-      topic51 = { id: 501, title: 'Terraform & Infrastructure as Code (IaC)', description: 'HCL syntax, state management, modules, and multi-environment cloud provisioning.', estimated_hours: 10, difficulty: 'Medium', is_completed: false, resources: [] };
-      topic52 = { id: 502, title: 'Kubernetes Cluster Management & Helm', description: 'Pods, Deployments, Services, Ingress controllers, Helm charts, and Secrets.', estimated_hours: 12, difficulty: 'Hard', is_completed: false, resources: [] };
-      sysTitle = 'Reliability Engineering & Monitoring';
-      topic61 = { id: 601, title: 'Prometheus, Grafana & Log Aggregation', description: 'Metrics scraping, alertmanager rules, ELK stack log processing, and tracing.', estimated_hours: 8, difficulty: 'Medium', is_completed: false, resources: [] };
-      topic62 = { id: 602, title: 'Zero Downtime Deployments & Service Mesh', description: 'Canary releases, Blue/Green strategies, Istio service mesh, and mTLS security.', estimated_hours: 10, difficulty: 'Hard', is_completed: false, resources: [] };
-    }
-
-    return {
-      id: 1,
-      target_role: targetRole,
-      progress_percentage: 0,
-      estimated_completion_date: '60 days from now',
-      stages_data: [
-        {
-          id: 1,
-          title: `Programming Foundations for ${targetRole}`,
-          description: `Master fundamental language syntax, object-oriented concepts, and memory structures essential for ${targetRole}.`,
-          topics: [
-            { id: 101, title: 'Data Types, Scoping & Control Flow', description: 'Variables, memory pointers, loops, conditional logic, and recursion fundamentals.', estimated_hours: 4, difficulty: 'Easy', is_completed: false, resources: [{ type: 'Documentation', title: 'Language Spec', url: 'https://docs.python.org' }] },
-            { id: 102, title: 'Object-Oriented & Functional Design', description: 'Classes, Inheritance, Interfaces, Immutability, Lambda expressions, and Clean Code principles.', estimated_hours: 6, difficulty: 'Medium', is_completed: false, resources: [{ type: 'YouTube', title: 'OOP Architecture', url: 'https://youtube.com' }] }
-          ]
-        },
-        {
-          id: 2,
-          title: 'Core Data Structures & Memory Layouts',
-          description: 'Building blocks of memory allocation, indexing, search trees, and dynamic arrays.',
-          topics: [
-            { id: 201, title: 'Arrays, Strings & Hash Tables', description: 'Contiguous memory, string manipulation, hash collisions, and constant-time lookups.', estimated_hours: 8, difficulty: 'Medium', is_completed: false, resources: [] },
-            { id: 202, title: 'Linked Lists, Stacks & Queues', description: 'Pointers, node traversal, double-ended queues, stack call frames, and queue buffers.', estimated_hours: 8, difficulty: 'Medium', is_completed: false, resources: [] }
-          ]
-        },
-        {
-          id: 3,
-          title: 'Advanced Algorithmic Paradigms',
-          description: 'Formulate optimal time/space complexity solutions using standard algorithmic patterns.',
-          topics: [
-            { id: 301, title: 'Binary Search, Two Pointers & Sliding Window', description: 'Logarithmic search spaces, subarray window tracking, and optimal pointer increments.', estimated_hours: 8, difficulty: 'Medium', is_completed: false, resources: [] },
-            { id: 302, title: 'Dynamic Programming & Greedy Algorithms', description: 'Subproblem overlap, memoization tables, bottom-up tabulation, and optimal choices.', estimated_hours: 12, difficulty: 'Hard', is_completed: false, resources: [] }
-          ]
-        },
-        {
-          id: 4,
-          title: 'Database Systems & Data Persistence',
-          description: 'Structure relational schemas, write optimized SQL queries, and configure NoSQL databases.',
-          topics: [
-            { id: 401, title: 'SQL Deep Dive, Indexing & Transactions', description: 'B-Tree indexing, JOIN optimization, ACID guarantees, and database normalization.', estimated_hours: 6, difficulty: 'Medium', is_completed: false, resources: [] },
-            { id: 402, title: 'NoSQL Key-Value Stores & Document DBs', description: 'MongoDB, Redis caching strategies, TTL expiration policies, and document modeling.', estimated_hours: 6, difficulty: 'Medium', is_completed: false, resources: [] }
-          ]
-        },
-        {
-          id: 5,
-          title: specTitle,
-          description: specDesc,
-          topics: [topic51, topic52]
-        },
-        {
-          id: 6,
-          title: sysTitle,
-          description: `Architect scalability, high throughput, and system reliability for ${targetRole} software environments.`,
-          topics: [topic61, topic62]
-        },
-        {
-          id: 7,
-          title: 'DevOps Pipeline & Capstone Placement Project',
-          description: 'Build, containerize, and deploy a complete production-grade application for your resume portfolio.',
-          topics: [
-            { id: 701, title: 'Docker Containerization & Multi-Stage Builds', description: 'Writing Dockerfiles, environment variables, docker-compose, and microservice networking.', estimated_hours: 6, difficulty: 'Medium', is_completed: false, resources: [] },
-            { id: 702, title: 'CI/CD & Cloud Deployment Capstone Project', description: 'GitHub Actions pipelines, automated testing, production hosting, and live portfolio demo.', estimated_hours: 12, difficulty: 'Medium', is_completed: false, resources: [] }
-          ]
-        },
-        {
-          id: 8,
-          title: 'LeetCode Mastery & FAANG Mock Interviews',
-          description: 'Consolidate your technical skills, practice algorithmic interviews, and refine behavioral responses.',
-          topics: [
-            { id: 801, title: 'Top FAANG Coding Interview Patterns', description: 'Graph BFS/DFS, Tree LCA, Heap Top-K, Dynamic Programming, and Interval Merging.', estimated_hours: 15, difficulty: 'Hard', is_completed: false, resources: [] },
-            { id: 802, title: 'Mock Interviews, STAR Technique & Soft Skills', description: 'Behavioral STAR framework, handling interviewer hints, and articulating trade-offs under time pressure.', estimated_hours: 10, difficulty: 'Medium', is_completed: false, resources: [] }
-          ]
-        }
-      ]
-    };
-  };
-
   const createMockProfile = (emailVal: string, nameVal: string): UserProfile => ({
     id: Date.now(), email: emailVal, full_name: nameVal || emailVal.split('@')[0],
     role: 'Student', education: '', semester: '', skills: [], languages_known: [],
@@ -825,82 +816,85 @@ export default function GapXApp() {
     }
   };
 
-  // --- AUTH (backend-first, local fallback) ---
+  // --- AUTH ---
   const handleAuth = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true); setErrorMessage('');
     try {
       const endpoint = authMode === 'login' ? 'login' : 'register';
       const body = authMode === 'login' ? { email, password } : { email, password, full_name: fullName };
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 15000); // 15s timeout for resilient local connection
+      if (authMode === 'register' && password.length < 6) throw new Error('Use a password with at least 6 characters.');
       let r: Response;
       try {
         r = await fetch(`${BACKEND_URL}/auth/${endpoint}`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body), signal: controller.signal
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
         });
-        clearTimeout(timer);
       } catch (_) {
-        clearTimeout(timer);
-        // Backend unreachable — use local mock auth
-        setIsOfflineMode(true);
-        const existingUsers: any[] = JSON.parse(localStorage.getItem('gapx_users') || '[]');
-        if (authMode === 'register') {
-          if (existingUsers.find((u: any) => u.email === email)) throw new Error('Email already registered. Try signing in.');
-          const prof = createMockProfile(email, fullName);
-          const tok = 'local_' + Date.now();
-          existingUsers.push({ email, password, profile: prof, token: tok });
-          localStorage.setItem('gapx_users', JSON.stringify(existingUsers));
-          await enterDashboard(tok, prof);
-        } else {
-          const found = existingUsers.find((u: any) => u.email === email && u.password === password);
-          if (!found) throw new Error('Account not found. Please create an account first.');
-          await enterDashboard(found.token, found.profile);
-        }
-        return;
+        throw new Error("Can't reach the GapX server. Make sure the backend is running (run_app.bat), then try again.");
       }
       const d = await r.json();
-      if (!r.ok) throw new Error(d.detail || 'Authentication failed');
+      if (!r.ok) throw new Error(typeof d.detail === 'string' ? d.detail : 'Authentication failed');
       setIsOfflineMode(false);
-      let prof = await fetchProfile(d.access_token);
-      if (!prof) prof = createMockProfile(email, fullName);
+      const prof = await fetchProfile(d.access_token);
+      if (!prof) throw new Error('Signed in, but your profile could not be loaded. Please try again.');
       await enterDashboard(d.access_token, prof);
     } catch (err: any) {
       setErrorMessage(err.message || 'Something went wrong. Please try again.');
     } finally { setLoading(false); }
   };
 
-  const handleGoogleLogin = async () => {
+  const completeTokenLogin = async (accessToken: string) => {
+    const prof = await fetchProfile(accessToken);
+    if (!prof) throw new Error('Could not load your profile.');
+    await enterDashboard(accessToken, prof);
+  };
+
+  // Google Identity Services: the official button appears when GOOGLE_CLIENT_ID is set on the backend
+  useEffect(() => {
+    const clientId = authConfig.google_client_id;
+    if (!clientId || appState !== 'auth') return;
+    const init = () => {
+      const g = (window as any).google;
+      if (!g?.accounts?.id || !googleBtnRef.current) return;
+      g.accounts.id.initialize({
+        client_id: clientId,
+        callback: async (resp: any) => {
+          setLoading(true); setErrorMessage('');
+          try {
+            const r = await fetch(`${BACKEND_URL}/auth/google`, {
+              method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ credential: resp.credential })
+            });
+            const d = await r.json();
+            if (!r.ok) throw new Error(d.detail || 'Google sign-in failed');
+            await completeTokenLogin(d.access_token);
+          } catch (err: any) { setErrorMessage(err.message); } finally { setLoading(false); }
+        },
+      });
+      googleBtnRef.current.innerHTML = '';
+      g.accounts.id.renderButton(googleBtnRef.current, { theme: themeMode === 'dark' ? 'filled_black' : 'outline', size: 'large', width: 360, text: 'continue_with', shape: 'pill' });
+    };
+    if ((window as any).google?.accounts?.id) { init(); return; }
+    const script = document.createElement('script');
+    script.src = 'https://accounts.google.com/gsi/client';
+    script.async = true;
+    script.onload = init;
+    document.head.appendChild(script);
+  }, [authConfig.google_client_id, appState, themeMode]);
+
+  const handleDemoLogin = async () => {
     setLoading(true); setErrorMessage('');
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 4000);
-      try {
-        const r = await fetch(`${BACKEND_URL}/auth/google`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email: 'demo@gapx.ai', name: 'Demo Student' }),
-          signal: controller.signal
-        });
-        clearTimeout(timer);
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.detail || 'Google login failed');
-        setIsOfflineMode(false);
-        const prof = await fetchProfile(d.access_token);
-        await enterDashboard(d.access_token, prof);
-      } catch (_) {
-        clearTimeout(timer);
-        // Offline fallback — demo account
-        setIsOfflineMode(true);
-        const prof = createMockProfile('demo@gapx.ai', 'Demo Student');
-        await enterDashboard('local_demo_' + Date.now(), prof);
-      }
+      let r: Response;
+      try { r = await fetch(`${BACKEND_URL}/auth/demo`, { method: 'POST' }); }
+      catch (_) { throw new Error("Can't reach the GapX server."); }
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || 'Demo login is unavailable');
+      await completeTokenLogin(d.access_token);
     } catch (err: any) {
       setErrorMessage(err.message || 'Something went wrong.');
     } finally { setLoading(false); }
   };
 
-  // --- ONBOARDING ---
   const handleOnboard = async () => {
     if (!token) return;
     setLoading(true); setErrorMessage('');
@@ -937,28 +931,6 @@ export default function GapXApp() {
         formattedSem = `${goal}${time}`;
       }
 
-      if (isOfflineMode || token.startsWith('local_')) {
-        const updatedProf: UserProfile = {
-          ...(userProfile || createMockProfile(email, fullName)),
-          role: onboardData.role,
-          education: formattedEdu,
-          semester: formattedSem,
-          skills: onboardData.skills,
-          languages_known: onboardData.languages,
-          experience_level: onboardData.experienceLevel,
-          preferred_learning_hours: onboardData.learningHours,
-          expected_placement_date: onboardData.expectedPlacement,
-          target_roles: onboardData.targetRoles,
-          xp: 100, level: 1
-        };
-        setUserProfile(updatedProf);
-        saveSession(token, updatedProf);
-        syncResumeWithProfile(updatedProf, onboardData);
-        setRoadmap(createMockRoadmap(onboardData.targetRoles[0] || 'Software Engineer'));
-        setAppState('dashboard');
-        fetchProblems(token);
-        return;
-      }
       const r = await fetch(`${BACKEND_URL}/users/onboard`, {
         method: 'PUT', headers: authHeaders(),
         body: JSON.stringify({
@@ -998,13 +970,7 @@ export default function GapXApp() {
       const rmr = await fetch(`${BACKEND_URL}/roadmaps/generate`, { method: 'POST', headers: authHeaders() });
       if (rmr.ok) {
         const rd = await rmr.json();
-        if (rd && Array.isArray(rd.stages_data) && rd.stages_data.length >= 6) {
-          setRoadmap(rd);
-        } else {
-          setRoadmap(createMockRoadmap(onboardData.targetRoles[0] || 'Software Engineer'));
-        }
-      } else {
-        setRoadmap(createMockRoadmap(onboardData.targetRoles[0] || 'Software Engineer'));
+        if (rd && Array.isArray(rd.stages_data)) setRoadmap(rd);
       }
       setAppState('dashboard');
       fetchProblems(token!); fetchNotifications(token!);
@@ -1024,7 +990,7 @@ export default function GapXApp() {
       });
       if (r.ok) {
         const data = await r.json();
-        if (data && Array.isArray(data.stages_data) && data.stages_data.length >= 6) {
+        if (data && Array.isArray(data.stages_data) && data.stages_data.length > 0) {
           setRoadmap(data);
           fetchProfile(token);
           fetchNotifications(token);
@@ -1035,7 +1001,7 @@ export default function GapXApp() {
     finally {
       setRoadmapLoading(false);
     }
-    setRoadmap(createMockRoadmap(targetRole));
+    alert("Couldn't generate the roadmap. Check that the backend is running and try again.");
   };
 
   const toggleTopic = async (stageId: any, topicId: any, currentCompleted: boolean) => {
@@ -1093,7 +1059,8 @@ export default function GapXApp() {
     } catch (_) {}
   };
 
-  const openTopicNotes = async (stageId: any, topic: any, stageTitle: string) => {
+  const openTopicNotes = async (stageId: any, topic: any, stageTitle: string, withExplainer: boolean = false) => {
+    setExplainerOpen(withExplainer);
     setSelectedNotesTopic({ ...topic, stageId, stageTitle });
     setActiveNotesLoading(true);
     setActiveNotes(null);
@@ -1108,25 +1075,33 @@ export default function GapXApp() {
         throw new Error('Failed to fetch detailed notes');
       }
     } catch (err: any) {
-      // Local comprehensive fallback notes for offline resilience
-      setActiveNotes({
-        title: topic.title,
-        stage: stageTitle,
-        role: userProfile?.target_roles?.[0] || 'Software Engineer',
-        executive_summary: `${topic.title} is a core academic and industrial pillar within ${stageTitle}. It provides foundational principles for software engineering and is frequently evaluated in placement rounds.`,
-        key_concepts: [
-          { name: 'Core Foundations', explanation: `Essential syntax, memory layout, and operational rules for ${topic.title}.` },
-          { name: 'Architecture & Scaling', explanation: `How ${topic.title} behaves under concurrent traffic and high throughput environments.` }
-        ],
-        code_example: `# Production Implementation: ${topic.title}\ndef demonstrate_${(topic.title || 'topic').toLowerCase().replace(/[^a-z0-9]/g, '_')}():\n    print("Executing placement code for ${topic.title}")\n    return True\n`,
-        interview_questions: [
-          { question: `Explain the importance of ${topic.title} in scalable applications.`, ideal_answer: `In production systems, ${topic.title} ensures clean architecture, optimal execution latency, and reliable memory management.`, difficulty: 'Medium' }
-        ],
-        best_practices: ['Write modular code with unit tests', 'Profile memory and CPU before optimizing'],
-        summary: `Review core definitions, time complexity, and practical code implementations of ${topic.title} before technical interviews.`
-      });
+      setActiveNotes(null);
     } finally {
       setActiveNotesLoading(false);
+    }
+  };
+
+  const [cheatsheetLoading, setCheatsheetLoading] = useState(false);
+  const [explainerOpen, setExplainerOpen] = useState(false);
+  const downloadCheatsheet = async () => {
+    setCheatsheetLoading(true);
+    try {
+      const res = await fetch(`${BACKEND_URL}/roadmaps/cheatsheet-pdf`, { headers: authHeaders() });
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        throw new Error(typeof d.detail === 'string' ? d.detail : 'Could not create the notes PDF.');
+      }
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `GapX_${(roadmap?.target_role || 'Roadmap').replace(/[^a-zA-Z0-9]/g, '_')}_Last_Minute_Notes.pdf`;
+      document.body.appendChild(a); a.click(); a.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err: any) {
+      alert(err.message || 'Could not download the notes.');
+    } finally {
+      setCheatsheetLoading(false);
     }
   };
 
@@ -1134,7 +1109,7 @@ export default function GapXApp() {
     const key = `${stageId}-${topicId}`;
     setNotesLoading(key);
     try {
-      const url = `${BACKEND_URL}/roadmaps/notes-pdf/${stageId}/${topicId}?token=${encodeURIComponent(token || '')}`;
+      const url = `${BACKEND_URL}/roadmaps/notes-pdf/${stageId}/${topicId}`;
       const res = await fetch(url, {
         headers: authHeaders()
       });
@@ -1165,221 +1140,121 @@ export default function GapXApp() {
     return /^(https?:\/\/)?(www\.)?github\.com\/[a-zA-Z0-9_\-\.]+\/?$/i.test(url.trim());
   };
 
-  const handleResumeSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!token) return;
+  // Builds the API payload from the resume form (shared by scoring, summary and PDF download)
+  const buildResumePayload = () => {
+    const list = (v: string) => v.split(',').map(x => x.trim()).filter(Boolean);
+    const lines = (v: string) => v.split('\n').map(x => x.replace(/^[•\-*]\s*/, '').trim()).filter(Boolean);
+    const projects = [
+      { name: resumeForm.project1Title, stack: resumeForm.project1Stack, link: resumeForm.project1Link, bullets: lines(resumeForm.project1Bullets) },
+      { name: resumeForm.project2Title, stack: resumeForm.project2Stack, link: resumeForm.project2Link, bullets: lines(resumeForm.project2Bullets) },
+    ].filter(pr => pr.name.trim());
+    return {
+      name: resumeForm.name || userProfile?.full_name || 'Candidate',
+      headline: resumeForm.headline || userProfile?.target_roles?.[0] || '',
+      email: resumeForm.email || userProfile?.email,
+      phone: resumeForm.phone,
+      location: resumeForm.location,
+      linkedin: resumeForm.linkedin,
+      github: resumeForm.github,
+      portfolio: resumeForm.portfolio,
+      summary: resumeForm.summary,
+      education: resumeForm.education,
+      college: resumeForm.college,
+      semester: resumeForm.gradYear,
+      cgpa: resumeForm.cgpa || null,
+      skills: list(resumeForm.skills),
+      languages: list(resumeForm.languages),
+      frameworks: list(resumeForm.frameworks),
+      tools: list(resumeForm.tools),
+      experience: resumeForm.experienceCompany ? [{
+        company: resumeForm.experienceCompany,
+        role: resumeForm.experienceRole,
+        dates: resumeForm.experienceDuration,
+        location: resumeForm.experienceLocation,
+        bullets: lines(resumeForm.experienceBullets)
+      }] : [],
+      projects,
+      certifications: list(resumeForm.certifications),
+      achievements: list(resumeForm.achievements),
+      interests: list(resumeForm.interests),
+      is_fresher: userProfile?.role === 'Student' || !resumeForm.experienceCompany,
+    };
+  };
 
+  const validateResumeLinks = () => {
     if (resumeForm.linkedin && !isValidLinkedIn(resumeForm.linkedin)) {
       alert('Please enter a valid LinkedIn profile URL (e.g. https://linkedin.com/in/username).');
-      return;
+      return false;
     }
     if (resumeForm.github && !isValidGitHub(resumeForm.github)) {
       alert('Please enter a valid GitHub profile URL (e.g. https://github.com/username).');
-      return;
+      return false;
     }
+    return true;
+  };
 
+  const generateResumeSummary = async () => {
+    if (!token) return;
+    setSummaryLoading(true);
+    try {
+      const r = await fetch(`${BACKEND_URL}/resumes/generate-summary`, {
+        method: 'POST', headers: authHeaders(), body: JSON.stringify(buildResumePayload())
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(typeof d.detail === 'string' ? d.detail : 'Could not write a summary.');
+      setResumeForm(prev => ({ ...prev, summary: d.summary }));
+    } catch (err: any) {
+      alert(err.message || "Couldn't generate the summary. Check that the backend is running.");
+    } finally {
+      setSummaryLoading(false);
+    }
+  };
+
+  const handleResumeSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!token || !validateResumeLinks()) return;
     setLoading(true);
     try {
-      const parsedCgpa = resumeForm.cgpa ? parseFloat(resumeForm.cgpa) : null;
-      const payload = {
-        name: resumeForm.name || userProfile?.full_name || 'Candidate',
-        headline: resumeForm.headline,
-        email: resumeForm.email || userProfile?.email,
-        phone: resumeForm.phone,
-        location: resumeForm.location,
-        linkedin: resumeForm.linkedin,
-        github: resumeForm.github,
-        portfolio: resumeForm.portfolio,
-        summary: resumeForm.summary,
-        education: resumeForm.education,
-        semester: resumeForm.gradYear,
-        cgpa: parsedCgpa,
-        skills: resumeForm.skills.split(',').map(s => s.trim()).filter(Boolean),
-        languages: resumeForm.languages.split(',').map(s => s.trim()).filter(Boolean),
-        frameworks: resumeForm.frameworks.split(',').map(s => s.trim()).filter(Boolean),
-        tools: resumeForm.tools.split(',').map(s => s.trim()).filter(Boolean),
-        experience: resumeForm.experienceCompany ? [{
-          company: resumeForm.experienceCompany,
-          role: resumeForm.experienceRole,
-          dates: resumeForm.experienceDuration,
-          location: resumeForm.experienceLocation,
-          bullets: resumeForm.experienceBullets.split('\n').filter(Boolean)
-        }] : [],
-        projects: resumeForm.project1Title ? [{
-          name: resumeForm.project1Title,
-          stack: resumeForm.project1Stack,
-          link: resumeForm.project1Link,
-          bullets: resumeForm.project1Bullets.split('\n').filter(Boolean)
-        }] : [],
-        certifications: resumeForm.certifications.split(',').map(s => s.trim()).filter(Boolean),
-        achievements: resumeForm.achievements.split(',').map(s => s.trim()).filter(Boolean)
-      };
-
-      let r: Response | null = null;
-      try {
-        r = await fetch(`${BACKEND_URL}/resumes/manual`, {
-          method: 'POST',
-          headers: authHeaders(),
-          body: JSON.stringify(payload)
-        });
-
-        // If credentials could not be validated (e.g. expired session), silently renew token and retry
-        if (r && r.status === 401) {
-          try {
-            const authR = await fetch(`${BACKEND_URL}/auth/google`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ email: payload.email || userProfile?.email || 'demo@gapx.ai', name: payload.name || userProfile?.full_name || 'Candidate' })
-            });
-            if (authR.ok) {
-              const authD = await authR.json();
-              if (authD.access_token) {
-                setToken(authD.access_token);
-                saveSession(authD.access_token, userProfile || ({} as any));
-                r = await fetch(`${BACKEND_URL}/resumes/manual`, {
-                  method: 'POST',
-                  headers: { 'Authorization': `Bearer ${authD.access_token}`, 'Content-Type': 'application/json' },
-                  body: JSON.stringify(payload)
-                });
-              }
-            }
-          } catch (_) {}
-        }
-      } catch (_) {}
-
-      if (r && r.ok) {
-        const data = await r.json();
-        setResumeAnalysis(data);
-        setResumeMode('preview');
-        fetchProfile(token);
-        fetchReadiness(token);
-        fetchNotifications(token);
-      } else {
-        // Resilient Fallback: Compute instant, accurate ATS evaluation locally so candidate never loses data
-        const calculatedAts = Math.min(95, Math.max(50, 45 + (payload.skills.length * 5) + (payload.projects.length * 15) + (payload.experience.length * 15)));
-        const localAnalysis = {
-          ats_score: calculatedAts,
-          resume_score: calculatedAts + 4,
-          readiness_level: calculatedAts >= 75 ? 'Industry Ready' : calculatedAts >= 60 ? 'Competitive' : 'Developing',
-          strengths: [
-            `Strong coverage in technical skills (${payload.skills.slice(0, 4).join(', ') || 'Engineering'})`,
-            'Clean chronological layout with standard ATS-friendly section headings',
-            payload.projects.length > 0 ? `Showcases ${payload.projects.length} hands-on technical project(s)` : 'Clear foundational academic background'
-          ],
-          weaknesses: [
-            payload.experience.length === 0 ? 'Adding an internship or open-source contribution will raise ATS rank by ~15%' : 'Quantify bullet points with impact metrics (e.g. reduced latency by 30%)'
-          ],
-          missing_skills: ['Docker', 'CI/CD Pipelines', 'System Design'],
-          missing_keywords: ['Agile / Scrum', 'Unit Testing', 'RESTful API Design'],
-          suggestions: [
-            'Incorporate the Google XYZ formula: Accomplished [X], as measured by [Y], by doing [Z].',
-            'Ensure LinkedIn and GitHub profiles have clean, working links.',
-            'Include metrics and numerical results in project descriptions.'
-          ],
-          resume_data: payload
-        };
-        setResumeAnalysis(localAnalysis);
-        setResumeMode('preview');
-      }
+      const r = await fetch(`${BACKEND_URL}/resumes/manual`, {
+        method: 'POST', headers: authHeaders(), body: JSON.stringify(buildResumePayload())
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Could not score your resume.');
+      setResumeAnalysis({ ...data, resume_data: buildResumePayload() });
+      setResumeMode('preview');
+      fetchProfile(token);
+      fetchReadiness(token);
+      fetchNotifications(token);
     } catch (err: any) {
-      alert(err.message || 'Error processing resume.');
+      alert(err.message?.includes('fetch') ? "Can't reach the GapX server. Start the backend and try again." : (err.message || 'Error processing resume.'));
     } finally {
       setLoading(false);
     }
   };
 
   const downloadResumePdf = async () => {
-    if (!token) return;
+    if (!token || !validateResumeLinks()) return;
     setResumePdfLoading(true);
     try {
-      const parsedCgpa = resumeForm.cgpa ? parseFloat(resumeForm.cgpa) : null;
-      const payload = {
-        name: resumeForm.name || userProfile?.full_name || 'Candidate',
-        headline: resumeForm.headline,
-        email: resumeForm.email || userProfile?.email,
-        phone: resumeForm.phone,
-        location: resumeForm.location,
-        linkedin: resumeForm.linkedin,
-        github: resumeForm.github,
-        portfolio: resumeForm.portfolio,
-        summary: resumeForm.summary,
-        education: resumeForm.education,
-        semester: resumeForm.gradYear,
-        cgpa: parsedCgpa,
-        skills: resumeForm.skills.split(',').map(s => s.trim()).filter(Boolean),
-        languages: resumeForm.languages.split(',').map(s => s.trim()).filter(Boolean),
-        frameworks: resumeForm.frameworks.split(',').map(s => s.trim()).filter(Boolean),
-        tools: resumeForm.tools.split(',').map(s => s.trim()).filter(Boolean),
-        experience: resumeForm.experienceCompany ? [{
-          company: resumeForm.experienceCompany,
-          role: resumeForm.experienceRole,
-          dates: resumeForm.experienceDuration,
-          location: resumeForm.experienceLocation,
-          bullets: resumeForm.experienceBullets.split('\n').filter(Boolean)
-        }] : [],
-        projects: resumeForm.project1Title ? [{
-          name: resumeForm.project1Title,
-          stack: resumeForm.project1Stack,
-          link: resumeForm.project1Link,
-          bullets: resumeForm.project1Bullets.split('\n').filter(Boolean)
-        }] : [],
-        certifications: resumeForm.certifications.split(',').map(s => s.trim()).filter(Boolean),
-        achievements: resumeForm.achievements.split(',').map(s => s.trim()).filter(Boolean)
-      };
-
-      let response: Response | null = null;
-      try {
-        response = await fetch(`${BACKEND_URL}/resumes/download-pdf`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`
-          },
-          body: JSON.stringify(payload)
-        });
-
-        if (response && response.status === 401) {
-          const authR = await fetch(`${BACKEND_URL}/auth/google`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ email: payload.email || userProfile?.email || 'demo@gapx.ai', name: payload.name || userProfile?.full_name || 'Candidate' })
-          });
-          if (authR.ok) {
-            const authD = await authR.json();
-            if (authD.access_token) {
-              setToken(authD.access_token);
-              saveSession(authD.access_token, userProfile || ({} as any));
-              response = await fetch(`${BACKEND_URL}/resumes/download-pdf`, {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  Authorization: `Bearer ${authD.access_token}`
-                },
-                body: JSON.stringify(payload)
-              });
-            }
-          }
-        }
-      } catch (_) {}
-
-      if (!response || !response.ok) {
-        // Fallback: trigger standard browser print dialog for immediate clean PDF save
-        window.print();
-        return;
+      const response = await fetch(`${BACKEND_URL}/resumes/download-pdf`, {
+        method: 'POST', headers: authHeaders(), body: JSON.stringify(buildResumePayload())
+      });
+      if (!response.ok) {
+        const d = await response.json().catch(() => ({}));
+        throw new Error(typeof d.detail === 'string' ? d.detail : 'Could not generate the PDF.');
       }
-
       const blob = await response.blob();
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
       const downloadName = (resumeForm.name || userProfile?.full_name || 'Candidate').replace(/\s+/g, '_');
-      a.download = `${downloadName}_Standard_Resume.pdf`;
+      a.download = `${downloadName}_Resume.pdf`;
       document.body.appendChild(a);
       a.click();
       a.remove();
       window.URL.revokeObjectURL(url);
     } catch (err: any) {
-      alert(err.message || 'Error downloading resume PDF.');
+      alert(err.message?.includes('fetch') ? "Can't reach the GapX server. Start the backend and try again." : (err.message || 'Error downloading resume PDF.'));
     } finally {
       setResumePdfLoading(false);
     }
@@ -1525,29 +1400,20 @@ export default function GapXApp() {
           setActiveOutputTab('testcases');
         }
       } else {
-        throw new Error('Run failed');
+        const d = await r.json().catch(() => ({}));
+        setCodeOutput({ status: 'Error', execution_time: 0, memory_usage: 0, message: typeof d.detail === 'string' ? d.detail : 'The run request failed.', test_results: [], error_details: null });
       }
     } catch (_) {
-      const publicTcs = (activeProblem.test_cases || []).filter((tc: any) => !tc.is_hidden);
-      const chosenTcs = publicTcs.length > 0 ? publicTcs : (activeProblem.test_cases || []).slice(0, 2);
       setCodeOutput({
-        status: 'Accepted',
-        execution_time: 0.042,
-        memory_usage: 12.8,
-        message: 'All test cases executed successfully (sandbox)',
-        test_results: chosenTcs.map((tc: any, idx: number) => ({
-          test_case: idx + 1,
-          status: 'Passed',
-          input: tc.input || '',
-          expected_output: tc.output || '',
-          actual_output: tc.output || '',
-          execution_time: 0.02 + idx * 0.01,
-          is_hidden: Boolean(tc.is_hidden)
-        })),
+        status: 'Connection Error',
+        execution_time: 0,
+        memory_usage: 0,
+        message: "Couldn't reach the GapX server, so your code wasn't run. Make sure the backend is running and try again.",
+        test_results: [],
         ai_feedback: null,
-        error_details: null
+        error_details: { error_type: 'Connection Error', explanation: "The code runner is part of the backend. Start it with run_app.bat (or uvicorn) and try again.", raw_trace: '' }
       });
-      setActiveOutputTab('testcases');
+      setActiveOutputTab('diagnostics');
     } finally { setSubmittingCode(false); }
   };
 
@@ -1569,29 +1435,20 @@ export default function GapXApp() {
           fetchProblems(token); fetchProfile(token); fetchReadiness(token); fetchNotifications(token);
         }
       } else {
-        throw new Error('Submit failed');
+        const d = await r.json().catch(() => ({}));
+        setCodeOutput({ status: 'Error', execution_time: 0, memory_usage: 0, message: typeof d.detail === 'string' ? d.detail : 'The submit request failed.', test_results: [], error_details: null });
       }
     } catch (_) {
-      const allTcs = activeProblem.test_cases || [];
       setCodeOutput({
-        status: 'Accepted',
-        execution_time: 0.058,
-        memory_usage: 14.2,
-        message: 'All test cases passed successfully (+100 XP)',
-        test_results: allTcs.map((tc: any, idx: number) => ({
-          test_case: idx + 1,
-          status: 'Passed',
-          input: tc.input || '',
-          expected_output: tc.output || '',
-          actual_output: tc.output || '',
-          execution_time: 0.02 + idx * 0.01,
-          is_hidden: Boolean(tc.is_hidden)
-        })),
+        status: 'Connection Error',
+        execution_time: 0,
+        memory_usage: 0,
+        message: "Couldn't reach the GapX server, so your code wasn't run. Make sure the backend is running and try again.",
+        test_results: [],
         ai_feedback: null,
-        error_details: null
+        error_details: { error_type: 'Connection Error', explanation: "The code runner is part of the backend. Start it with run_app.bat (or uvicorn) and try again.", raw_trace: '' }
       });
-      setActiveOutputTab('testcases');
-      setCodingProblems(prev => prev.map(pr => pr.id === activeProblem.id ? { ...pr, is_solved: true } : pr));
+      setActiveOutputTab('diagnostics');
     } finally { setSubmittingCode(false); }
   };
 
@@ -1650,7 +1507,7 @@ export default function GapXApp() {
         selectProblem(codingProblems[0].id);
       }
     } else if (sidebarTab === 'roadmap') {
-      if (!roadmap || !roadmap.stages_data || roadmap.stages_data.length < 8) {
+      if (!roadmap || !roadmap.stages_data) {
         fetchRoadmap(token || '');
       }
     } else if (sidebarTab === 'resume') {
@@ -1791,383 +1648,116 @@ export default function GapXApp() {
   };
 
   // --- INTERVIEW ROOM EXECUTION ---
+  const applyInterviewTurn = (d: any) => {
+    if (d.phase) setInterviewPhase(d.phase);
+    if (d.question_number) setQuestionNumber(d.question_number);
+    if (d.total_questions) setTotalQuestions(d.total_questions);
+    if (d.question_kind) setQuestionKind(d.question_kind);
+    if (d.difficulty) setCurrentDifficulty(d.difficulty);
+    if (d.difficulty_change) setDifficultyChange(d.difficulty_change);
+    if (typeof d.current_live_score === 'number') setLiveInterviewScore(d.current_live_score);
+    if (typeof d.confidence_metric === 'number') setLiveConfidenceMetric(d.confidence_metric);
+    questionStartRef.current = Date.now();
+    setQuestionElapsed(0);
+  };
+
   const startInterview = async () => {
     if (!token) return;
     setLoading(true);
+    setErrorMessage('');
     setInterviewFeedback(null);
     setInterviewMessages([]);
     setCurrentTurnCorrection(null);
-
-    const role = targetInterviewRole || userProfile?.target_roles?.[0] || 'Software Engineer';
-    const type = interviewType;
-    const jd = jobDescription.trim();
-    const expLvl = experienceLevel || userProfile?.experience_level || 'Fresher';
-    const domain = topicDomain || 'AIML';
-    const initDiff = expLvl === 'Fresher' ? 'Easy' : 'Medium';
-    setCurrentDifficulty(initDiff);
     setDifficultyChange('same');
+    setLiveInterviewScore(0);
+    setLiveConfidenceMetric(0);
+    faceSamplesRef.current = [];
 
-    // Automatically enable camera
-    if (!webcamEnabled) {
-      toggleWebcam();
-    }
+    const track = INTERVIEW_TRACKS.find(t => t.id === topicDomain);
+    const role = targetInterviewRole || track?.label || userProfile?.target_roles?.[0] || 'Software Engineer';
+    if (!webcamEnabled) toggleWebcam();
 
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 6000);
-      let r: Response | null = null;
-      try {
-        r = await fetch(`${BACKEND_URL}/interviews/start`, {
-          method: 'POST', headers: authHeaders(),
-          body: JSON.stringify({
-            target_role: role,
-            experience_level: expLvl,
-            interview_type: type,
-            job_description: jd || undefined,
-            topic_domain: domain
-          }),
-          signal: controller.signal
-        });
-        clearTimeout(timer);
-      } catch (_) { clearTimeout(timer); }
-
-      let firstQ = '';
-      if (expLvl === 'Fresher') {
-        firstQ = domain === 'AIML'
-          ? `Welcome! I am Dr. Alex Vance, your Technical Interviewer for the ${role} position today. Since this interview is tailored for fresh graduates and early career engineers, let's start with your academic projects: Could you introduce yourself, walk me through any college or personal software projects you've built, and share which Machine Learning or AI concepts (such as Supervised Learning, Neural Networks, or Generative AI) you are most excited about?`
-          : `Welcome! I am Dr. Alex Vance, your Technical Interviewer for the ${role} position today. Since this interview is tailored for fresh graduates, let's start with your academic background: Could you introduce yourself, highlight your favorite academic or personal projects, and share what core programming languages and data structures you enjoy working with?`;
-      } else {
-        firstQ = jd 
-          ? `Welcome to your ${type} screening for the ${role} position based on your target Job Description! To begin, could you walk me through your engineering stack and describe the most technically complex project you've built?`
-          : `Welcome! I am Dr. Alex Vance, your Technical Interviewer for the ${role} position. To start off, please introduce yourself, walk me through your engineering journey, and describe your most challenging engineering project.`;
-      }
-      
-      let idVal = Date.now();
-
-      if (r && r.ok) {
-        const d = await r.json();
-        idVal = d.interview_id;
-        firstQ = d.first_question;
-        if (d.difficulty) setCurrentDifficulty(d.difficulty);
-      }
-
-      setInterviewId(idVal);
-      setInterviewMessages([{ role: 'interviewer', text: firstQ, is_first: true }]);
+      const r = await fetch(`${BACKEND_URL}/interviews/start`, {
+        method: 'POST', headers: authHeaders(),
+        body: JSON.stringify({
+          target_role: role,
+          experience_level: experienceLevel || 'Fresher',
+          interview_type: interviewType,
+          job_description: jobDescription.trim() || undefined,
+          track: topicDomain || undefined,
+          num_questions: interviewLength,
+        }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(typeof d.detail === 'string' ? d.detail : 'Could not start the interview.');
+      setInterviewId(d.interview_id);
+      setInterviewTrackLabel(d.track_label || role);
+      if (d.track && !topicDomain) setTopicDomain(d.track);
+      applyInterviewTurn({ ...d, question_number: 1, question_kind: 'intro' });
+      setInterviewMessages([{ role: 'interviewer', text: d.first_question, is_first: true }]);
       setInterviewStarted(true);
-      setLiveInterviewScore(80);
-      setLiveConfidenceMetric(85);
-      speakInterviewerText(firstQ);
+      speakInterviewerText(d.first_question);
     } catch (err: any) {
-      setErrorMessage(err.message);
+      const msg = err.message?.includes('fetch') ? "Can't reach the GapX server. Start the backend and try again." : err.message;
+      setErrorMessage(msg);
+      alert(msg);
     } finally {
       setLoading(false);
     }
   };
 
-  const generateDynamicClientFollowUp = (
-    role: string,
-    answer: string,
-    interviewerCount: number,
-    curDiff: string = 'Easy',
-    expLevel: string = 'Fresher',
-    domain: string = 'AIML'
-  ) => {
-    const ansLower = answer.toLowerCase();
-    const words = answer.trim().split(/\s+/);
-    const wordCount = words.length;
-
-    // Detect if answer is poor, blank, "I don't know", or "not even close to right"
-    const isDontKnow = /\b(don't know|dont know|not sure|no idea|cannot answer|can't answer|skip|dunno)\b/i.test(ansLower);
-    const isBrief = wordCount < 6;
-    const isWrong = isDontKnow || isBrief;
-
-    // Rich tech catalog across AIML & CS Core
-    const aimlQuestions: { [key: string]: string[] } = {
-      Easy: [
-        "Can you explain the fundamental difference between Supervised Learning, Unsupervised Learning, and Reinforcement Learning, and give a simple everyday example of each?",
-        "In machine learning, what does 'overfitting' mean, and what are simple techniques (like train/test split or regularization) a developer can use to prevent it?",
-        "In modern Generative AI, what is Prompt Engineering, and how does Zero-Shot prompting differ from Few-Shot prompting?",
-        "Why is Accuracy alone often misleading when evaluating a model on an imbalanced dataset (like 99% non-fraud vs 1% fraud), and what metric (such as Precision or Recall) would you look at instead?",
-        "What is an activation function in a neural network, and why do we need non-linear activations like ReLU rather than just linear combinations?"
-      ],
-      Medium: [
-        "How does Gradient Descent work to minimize the loss function during model training, and why is selecting an appropriate learning rate critical to avoid divergence or slow convergence?",
-        "How does Retrieval-Augmented Generation (RAG) work with vector embeddings and vector databases to prevent Large Language Models from hallucinating on custom enterprise data?",
-        "Can you explain the trade-off between Precision and Recall using a healthcare or spam detection scenario? When would you optimize for Recall over Precision?",
-        "How does the Self-Attention mechanism in Transformer architectures allow models to understand the contextual relationships between all words in a sentence simultaneously?",
-        "What is the difference between Model Pre-training, Fine-tuning, and In-Context prompting, and when would you choose Fine-tuning over prompting?"
-      ],
-      Hard: [
-        "In the Transformer attention formula Softmax((Q*K^T)/sqrt(d_k))*V, mathematically why is the dot product scaled by the square root of the key dimension d_k, and how do residual skip-connections prevent vanishing gradients?",
-        "What are Parameter-Efficient Fine-Tuning (PEFT) methods like LoRA (Low-Rank Adaptation), and how do low-rank decomposition matrices drastically reduce VRAM requirements during LLM training?",
-        "How do vanishing and exploding gradients occur mathematically in deep neural networks, and how do Layer Normalization and weight initialization methods (like He or Xavier) resolve them?",
-        "When serving Large Language Models in production, how do KV-caching, continuous batching, and speculative decoding optimize inference throughput and reduce latency?"
-      ]
-    };
-
-    const dsaQuestions: { [key: string]: string[] } = {
-      Easy: [
-        "Can you explain the difference between an Array and a Linked List in memory layout and time complexity for insertions and lookups?",
-        "What is a Hash Map, and how does it achieve O(1) average lookup time using a hash function?",
-        "Can you explain the four core principles of Object-Oriented Programming (OOP) — Encapsulation, Abstraction, Inheritance, and Polymorphism — with a simple real-world example?",
-        "What is the difference between a Process and a Thread in an Operating System, and what resources do they share?",
-        "In databases, what is the difference between a Primary Key and a Foreign Key, and why are indexes used on columns?"
-      ],
-      Medium: [
-        "In a Hash Table, how do hash collisions occur, and how do separate chaining (linked lists/trees) and open addressing (linear probing) resolve them?",
-        "What is the difference between BFS (Breadth-First Search) and DFS (Depth-First Search) on a graph or tree, and what data structures (Queue vs Stack) are used to implement each?",
-        "What are the ACID properties in database transactions, and why is the 'I' (Isolation) property critical when multiple users write data concurrently?",
-        "How does a Binary Search Tree (BST) work, and under what conditions can search complexity degrade from O(log N) to O(N)?",
-        "How does caching with Redis improve web application performance, and what is the difference between a Cache-Aside and a Write-Through strategy?"
-      ],
-      Hard: [
-        "How does a self-balancing tree (such as an AVL Tree or Red-Black Tree) maintain balance during insertions, and what rotations are performed?",
-        "How does Deadlock occur in concurrent programming, what are the four Coffman conditions, and how does strict lock ordering eliminate deadlocks?",
-        "Can you explain how Dijkstra's algorithm finds the shortest path, its time complexity using a Min-Heap, and why it fails with negative edge weights?",
-        "How does Optimistic Concurrency Control (version checking) differ from Pessimistic Locking under high contention, and when would you choose one over the other?"
-      ]
-    };
-
-    const diffOrder = ['Easy', 'Medium', 'Hard'];
-    let curIdx = diffOrder.indexOf(curDiff);
-    if (curIdx === -1) curIdx = 0;
-
-    // Technical indicator matching
-    const techIndicators = [
-      'supervised', 'unsupervised', 'overfitting', 'underfitting', 'regularization', 'gradient',
-      'learning rate', 'prompt', 'rag', 'embedding', 'transformer', 'attention', 'precision',
-      'recall', 'f1', 'loss', 'neural', 'weights', 'bias', 'time complexity', 'space complexity',
-      'o(1)', 'o(n)', 'hash', 'array', 'linked list', 'tree', 'database', 'sql', 'cache',
-      'process', 'thread', 'encapsulation', 'inheritance', 'polymorphism'
-    ];
-    const matched = techIndicators.filter(ind => ansLower.includes(ind));
-    const isSound = !isWrong && (matched.length >= 1 || wordCount >= 16);
-
-    let newDiff = curDiff;
-    let diffChange: 'decreased' | 'same' | 'increased' = 'same';
-    let nextQ = '';
-    let speechToSpeak = '';
-    let isCorrect = true;
-    let correction: string | null = null;
-    let idealAnswer: string | null = null;
-    let immediateFb: string | null = null;
-
-    const isAiml = domain === 'AIML' || /ai|ml|neural|llm|machine\s*learning|prompt/i.test(ansLower);
-    const questionBank = isAiml ? aimlQuestions : dsaQuestions;
-
-    if (!isSound) {
-      // ADAPTIVE STEP-DOWN: User answered poorly -> drop to lower level or stay at Easy
-      const newIdx = Math.max(0, curIdx - 1);
-      newDiff = diffOrder[newIdx];
-      diffChange = newIdx < curIdx ? 'decreased' : 'same';
-      isCorrect = false;
-
-      const pool = questionBank[newDiff] || questionBank['Easy'];
-      const qIdx = Math.min(pool.length - 1, interviewerCount % pool.length);
-      nextQ = pool[qIdx];
-
-      immediateFb = isDontKnow
-        ? "No problem at all! In placement interviews it's completely normal to take a step back and anchor on foundational concepts."
-        : "Your response was quite brief. In technical interviews, clearly define terms, explain mechanisms, and cite concrete examples.";
-      correction = "Always start with the core definition, explain the underlying mathematical or architectural principle, and give a simple example.";
-      idealAnswer = "A strong answer provides the foundational definition, explains the mechanism, and compares trade-offs.";
-      speechToSpeak = `That's completely okay! Let's take a step back and anchor on the foundational concept: ${nextQ}`;
-    } else {
-      // ADAPTIVE STEP-UP: User gave a solid answer -> step up difficulty
-      const newIdx = Math.min(diffOrder.length - 1, curIdx + 1);
-      newDiff = diffOrder[newIdx];
-      diffChange = newIdx > curIdx ? 'increased' : 'same';
-      isCorrect = true;
-
-      // Check if user specifically mentioned HashMaps, Redis, SQL, or AI concepts
-      if (/hash\s*map|hash\s*table/i.test(ansLower)) {
-        if (newDiff === 'Easy') nextQ = "You mentioned HashMaps. What is a hash function, and why does a HashMap offer O(1) average lookup time?";
-        else if (newDiff === 'Medium') nextQ = "You specifically mentioned HashMaps. How does collision resolution work internally (e.g. separate chaining vs open addressing), and how does the load factor trigger resizing?";
-        else nextQ = "Following up on HashMaps: in a multithreaded high-throughput service, how do you make HashMap access thread-safe without introducing severe mutex lock contention?";
-      } else if (/redis|cache|caching/i.test(ansLower)) {
-        if (newDiff === 'Easy') nextQ = "You mentioned caching. Can you explain what a cache is, and why storing frequently accessed data in RAM is faster than disk databases?";
-        else if (newDiff === 'Medium') nextQ = "You mentioned Redis caching. How do you choose an eviction policy (like allkeys-lru vs volatile-ttl), and how do you protect against cache stampedes?";
-        else nextQ = "In a distributed Redis cluster, how do you handle cache invalidation consistency across read replicas, and how do you maintain sub-50ms P99 latency during node failovers?";
-      } else {
-        const pool = questionBank[newDiff] || questionBank['Medium'];
-        const qIdx = Math.min(pool.length - 1, interviewerCount % pool.length);
-        nextQ = pool[qIdx];
-      }
-
-      const highlight = matched.length > 0 ? `regarding ${matched[0]}` : 'in your technical explanation';
-      immediateFb = `Excellent technical articulation! You accurately covered the core principles ${highlight}.`;
-      idealAnswer = "Strong answers identify primary concepts, state exact Big-O complexity or theoretical bounds, and discuss real-world edge cases.";
-      speechToSpeak = `Great explanation! You covered that concept ${highlight} very well. Now let's elevate the technical depth: ${nextQ}`;
-    }
-
-    return {
-      nextQ,
-      speechToSpeak,
-      isCorrect,
-      correction,
-      idealAnswer,
-      immediateFb,
-      newDifficulty: newDiff,
-      difficultyChange: diffChange
-    };
-  };
-
   const submitAnswerWithText = async (ansText?: string) => {
-    const ans = ansText || candidateResponse;
-    if (!ans || !ans.trim()) return;
+    const ans = (ansText || candidateResponse).trim();
+    if (!ans || !interviewId) return;
     stopVoiceRecording();
     setLoading(true);
-    
     const updatedMsgs = [...interviewMessages, { role: 'candidate', text: ans }];
     setInterviewMessages(updatedMsgs);
     setCandidateResponse('');
 
-    const role = targetInterviewRole || userProfile?.target_roles?.[0] || 'Software Engineer';
-    const interviewerCount = updatedMsgs.filter(m => m.role === 'interviewer').length;
-
     try {
-      let nextQ: string | null = null;
-      let isFinished = false;
-      let isCorrect = true;
-      let correctionText: string | null = null;
-      let idealAnsText: string | null = null;
-      let immediateFb: string | null = null;
-      let speechTextToSpeak: string | null = null;
-
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 6000);
-      let r: Response | null = null;
-
-      try {
-        r = await fetch(`${BACKEND_URL}/interviews/${interviewId}/answer`, {
-          method: 'POST', headers: authHeaders(),
-          body: JSON.stringify({
-            answer: ans,
-            audio_response: isRecording,
-            attention_metric: telemetry.attention / 100,
-            smile_metric: telemetry.smile / 100,
-            stress_metric: telemetry.stress / 100,
-            eye_contact_metric: telemetry.eye / 100,
-            wpm_metric: speechWpm,
-            filler_words_count: fillerWordsCount,
-            current_difficulty: currentDifficulty,
-            topic_domain: topicDomain
-          }),
-          signal: controller.signal
-        });
-        clearTimeout(timer);
-      } catch (_) { clearTimeout(timer); }
-
-      if (r && r.ok) {
-        const d = await r.json();
-        isFinished = d.is_finished;
-        nextQ = d.next_question;
-        isCorrect = d.is_correct ?? true;
-        correctionText = d.ai_correction || null;
-        idealAnsText = d.ideal_answer || null;
-        immediateFb = d.ai_immediate_feedback || null;
-        speechTextToSpeak = d.speech_text_to_speak || nextQ;
-        if (d.current_live_score) setLiveInterviewScore(d.current_live_score);
-        if (d.confidence_metric) setLiveConfidenceMetric(d.confidence_metric);
-        if (d.difficulty) setCurrentDifficulty(d.difficulty);
-        if (d.difficulty_change) setDifficultyChange(d.difficulty_change);
-      } else {
-        // Fallback local turn evaluation with dynamic contextual entity extraction & adaptive difficulty
-        if (interviewerCount >= 5) {
-          isFinished = true;
-        } else {
-          const dynamicTurn = generateDynamicClientFollowUp(role, ans, interviewerCount, currentDifficulty, experienceLevel, topicDomain);
-          nextQ = dynamicTurn.nextQ;
-          speechTextToSpeak = dynamicTurn.speechToSpeak;
-          isCorrect = dynamicTurn.isCorrect;
-          correctionText = dynamicTurn.correction;
-          idealAnsText = dynamicTurn.idealAnswer;
-          immediateFb = dynamicTurn.immediateFb;
-          if (dynamicTurn.newDifficulty) setCurrentDifficulty(dynamicTurn.newDifficulty as any);
-          if (dynamicTurn.difficultyChange) setDifficultyChange(dynamicTurn.difficultyChange as any);
-        }
-      }
-
-      // Update current turn correction card
-      setCurrentTurnCorrection({
-        is_correct: isCorrect,
-        ai_correction: correctionText,
-        ideal_answer: idealAnsText,
-        ai_immediate_feedback: immediateFb
+      const r = await fetch(`${BACKEND_URL}/interviews/${interviewId}/answer`, {
+        method: 'POST', headers: authHeaders(),
+        body: JSON.stringify({
+          answer: ans,
+          audio_response: isRecording,
+          wpm_metric: speechWpm,
+          filler_words_count: fillerWordsCount,
+          ...collectFaceMetrics(),
+        }),
       });
+      const d = await r.json();
+      if (!r.ok) throw new Error(typeof d.detail === 'string' ? d.detail : 'The interviewer could not process that answer.');
 
-      if (isFinished) {
+      applyInterviewTurn(d);
+      const correction = d.is_repeat ? null : {
+        is_correct: d.is_correct,
+        ai_correction: d.ai_correction,
+        ideal_answer: d.ideal_answer,
+        ai_immediate_feedback: d.ai_immediate_feedback,
+        turn_score: d.turn_score,
+      };
+      if (correction) setCurrentTurnCorrection(correction);
+
+      if (d.is_finished) {
+        setInterviewMessages([...updatedMsgs, { role: 'interviewer', text: d.speech_text_to_speak, ...(correction || {}) }]);
+        speakInterviewerText(d.speech_text_to_speak);
+        const fbRes = await fetch(`${BACKEND_URL}/interviews/${interviewId}/feedback`, { headers: authHeaders() });
+        if (fbRes.ok) setInterviewFeedback(await fbRes.json());
         setInterviewStarted(false);
-
-        // Attempt to fetch full comprehensive feedback report from backend
-        let serverFeedback: any = null;
-        try {
-          const fbRes = await fetch(`${BACKEND_URL}/interviews/${interviewId}/feedback`, {
-            headers: authHeaders()
-          });
-          if (fbRes.ok) {
-            serverFeedback = await fbRes.json();
-          }
-        } catch (_) {}
-
-        const fbObj = serverFeedback || {
-          target_role: role,
-          interview_type: interviewType,
-          technical_score: Math.min(Math.round(telemetry.attention * 0.95), 98),
-          communication_score: Math.min(Math.round(telemetry.eye * 0.96), 98),
-          confidence_score: Math.min(Math.round((100 - telemetry.stress) * 0.95), 96),
-          problem_solving_score: 90,
-          leadership_score: 86,
-          overall_score: 92,
-          feedback: {
-            strengths: [
-              "Clear technical articulation aligned with the interview requirements",
-              "Sustained eye contact and poised facial presentation",
-              "Demonstrated strong fundamentals and adaptability across problem scenarios"
-            ],
-            weaknesses: [
-              "Could explicitly state Big-O Time & Space complexity at the beginning of technical answers",
-              "Occasional brief pauses when navigating complex distributed consensus questions"
-            ],
-            mistakes: [
-              "When answering caching scenarios, remember to contrast Redis Cache-Aside vs Write-Through strategies.",
-              "In ML evaluation, explain why Precision/Recall or F1-Score prevents misleading accuracy metrics on imbalanced data."
-            ],
-            ideal_answers: [
-              {
-                question: "How do you architect high-throughput distributed APIs?",
-                ideal_answer: "Use asynchronous non-blocking event loops (FastAPI / Node), horizontal worker scaling behind an L7 load balancer, Redis distributed caching with TTLs, and database read-replicas with connection pooling."
-              }
-            ],
-            suggestions: [
-              "Pause for 2-3 seconds after each question to organize your response using the STAR format.",
-              "Verbalize architectural bottlenecks (CPU, Memory, Network I/O) before jumping into code solutions."
-            ],
-            practice_plan: [
-              "Day 1-2: Review Top 15 Machine Learning & System Design patterns (Embeddings, RAG, Sharding, Caching).",
-              "Day 3-4: Solve 5 LeetCode Medium problems focusing on Graphs, Trees, and Dynamic Programming.",
-              "Day 5-7: Complete another AI Mock Interview session with live voice to consolidate fluency."
-            ]
-          }
-        };
-        setInterviewFeedback(fbObj);
-        speakInterviewerText(speechTextToSpeak || "Thank you! That completes our mock interview session. Your comprehensive performance scorecard and AI evaluation are ready.");
-        fetchProfile(token); fetchReadiness(token); fetchNotifications(token);
-      } else if (nextQ) {
+        if (token) { fetchProfile(token); fetchReadiness(token); fetchNotifications(token); }
+      } else {
         setInterviewMessages([
           ...updatedMsgs,
-          {
-            role: 'interviewer',
-            text: nextQ,
-            is_correct: isCorrect,
-            ai_correction: correctionText,
-            ideal_answer: idealAnsText,
-            ai_immediate_feedback: immediateFb
-          }
+          { role: 'interviewer', text: d.next_question, spoken: d.speech_text_to_speak, kind: d.question_kind, ...(correction || {}) },
         ]);
-        speakInterviewerText(speechTextToSpeak || nextQ);
+        speakInterviewerText(d.speech_text_to_speak || d.next_question);
       }
-    } catch (_) {
+    } catch (err: any) {
+      setInterviewMessages(interviewMessages);
+      setCandidateResponse(ans);
+      alert(err.message?.includes('fetch') ? "Lost connection to the GapX server. Your answer is still in the box; try again." : err.message);
     } finally {
       setLoading(false);
       setIsRecording(false);
@@ -2644,6 +2234,12 @@ public:
     return Math.min(s, 100);
   };
 
+  sessionExpiredRef.current = () => {
+    if (!localStorage.getItem('gapx_session')) return;
+    logout();
+    setErrorMessage('Your session has expired. Please sign in again.');
+  };
+
   const logout = () => {
     localStorage.removeItem('gapx_session');
     setAppState('auth');
@@ -2683,10 +2279,11 @@ public:
             exit={{ opacity: 0 }} transition={{ duration: 0.6 }}
           >
             <motion.div
-              className="w-20 h-20 mb-4 rounded-3xl bg-gradient-to-tr from-indigo-600 to-violet-600 flex items-center justify-center shadow-2xl shadow-indigo-500/40"
-              animate={{ rotate: 360 }} transition={{ repeat: Infinity, duration: 4, ease: 'linear' }}
+              className="mb-4 rounded-3xl shadow-2xl shadow-indigo-500/40"
+              initial={{ scale: 0.6, opacity: 0, rotate: -12 }} animate={{ scale: 1, opacity: 1, rotate: 0 }}
+              transition={{ type: 'spring', stiffness: 160, damping: 14 }}
             >
-              <Cpu className="w-10 h-10 text-white" />
+              <GapXLogo size={84} animated />
             </motion.div>
             <motion.h1
               className="text-4xl font-extrabold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-indigo-400 to-violet-400"
@@ -2695,15 +2292,24 @@ public:
               GapX AI
             </motion.h1>
             <p className="text-zinc-500 text-xs mt-2 tracking-widest uppercase">Skill Gap Intelligence Platform</p>
-            <div className="flex space-x-1.5 mt-8">
-              {[0, 150, 300].map(d => (
-                <div key={d} className="w-2 h-2 rounded-full bg-indigo-500 animate-bounce" style={{ animationDelay: `${d}ms` }} />
-              ))}
+            <div className="mt-8 w-40 h-1 rounded-full bg-zinc-800 overflow-hidden">
+              <motion.div className="h-full bg-gradient-to-r from-indigo-500 via-violet-500 to-fuchsia-500"
+                initial={{ width: '0%' }} animate={{ width: '100%' }} transition={{ duration: 1.8, ease: 'easeInOut' }} />
             </div>
           </motion.div>
         )}
       </AnimatePresence>
 
+      <AnimatePresence mode="wait">
+      {appState !== 'splash' && (
+      <motion.div
+        key={appState}
+        className="flex-1 flex flex-col"
+        initial={{ opacity: 0, y: 28, scale: 0.985 }}
+        animate={{ opacity: 1, y: 0, scale: 1 }}
+        exit={{ opacity: 0, y: -28, scale: 0.985 }}
+        transition={{ duration: 0.45, ease: [0.22, 1, 0.36, 1] }}
+      >
       {/* ── AUTH ── */}
       {appState === 'auth' && (
         <div className="flex-1 flex items-center justify-center p-6 bg-zinc-950 min-h-screen">
@@ -2712,9 +2318,7 @@ public:
             initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}
           >
             <div className="text-center mb-6">
-              <div className="w-14 h-14 mx-auto mb-3 rounded-2xl bg-gradient-to-tr from-indigo-600 to-violet-600 flex items-center justify-center">
-                <Cpu className="w-7 h-7 text-white" />
-              </div>
+              <GapXLogo size={56} className="mx-auto mb-3 drop-shadow-lg" />
               <h2 className="text-2xl font-bold">Welcome to GapX AI</h2>
               <p className="text-zinc-400 text-sm mt-1">Your AI-Powered Placement Coach</p>
             </div>
@@ -2750,21 +2354,23 @@ public:
               </button>
             </form>
 
-            <div className="relative my-5">
-              <div className="absolute inset-0 flex items-center"><div className="w-full border-t border-zinc-800" /></div>
-              <div className="relative flex justify-center"><span className="bg-zinc-900 px-3 text-xs text-zinc-500">or</span></div>
-            </div>
+            {(authConfig.google_client_id || authConfig.demo_login_enabled) && (
+              <div className="relative my-5">
+                <div className="absolute inset-0 flex items-center"><div className="w-full border-t border-zinc-800" /></div>
+                <div className="relative flex justify-center"><span className="bg-zinc-900 px-3 text-xs text-zinc-500">or</span></div>
+              </div>
+            )}
 
-            <button onClick={handleGoogleLogin} disabled={loading}
-              className="w-full py-2.5 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-sm font-medium rounded-xl flex items-center justify-center gap-2 transition-colors">
-              <svg className="w-4 h-4" viewBox="0 0 24 24">
-                <path fill="#EA4335" d="M12 5.04c1.66 0 3.2.57 4.38 1.69l3.27-3.27C17.67 1.48 14.97 1 12 1 7.35 1 3.4 3.65 1.5 7.5l3.86 3c.9-2.7 3.4-4.5 6.64-4.5z"/>
-                <path fill="#4285F4" d="M23.49 12.27c0-.82-.07-1.6-.2-2.38H12v4.51h6.46c-.28 1.47-1.1 2.72-2.35 3.56l3.66 2.84c2.14-1.97 3.72-4.88 3.72-8.53z"/>
-                <path fill="#FBBC05" d="M5.36 14.5c-.24-.72-.38-1.48-.38-2.27s.14-1.55.38-2.27L1.5 7.5C.54 9.4 0 11.55 0 13.77s.54 4.37 1.5 6.27l3.86-3.04z"/>
-                <path fill="#34A853" d="M12 23c3.24 0 5.97-1.07 7.96-2.91l-3.66-2.84c-1.01.68-2.31 1.09-3.8 1.09-3.24 0-5.74-1.8-6.64-4.5L1.5 16.88C3.4 20.73 7.35 23 12 23z"/>
-              </svg>
-              Continue with Google
-            </button>
+            {/* Official Google button (rendered by Google Identity Services when configured) */}
+            {authConfig.google_client_id && <div ref={googleBtnRef} className="flex justify-center min-h-[44px]" />}
+
+            {authConfig.demo_login_enabled && (
+              <button onClick={handleDemoLogin} disabled={loading} type="button"
+                className="w-full mt-3 py-2.5 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-sm font-medium rounded-xl flex items-center justify-center gap-2 transition-colors">
+                <Sparkles className="w-4 h-4 text-indigo-400" />
+                Try the demo account
+              </button>
+            )}
 
             <p className="text-center text-xs text-zinc-500 mt-5">
               {authMode === 'login' ? "Don't have an account? " : 'Already registered? '}
@@ -3231,15 +2837,13 @@ public:
 
       {/* ── DASHBOARD ── */}
       {appState === 'dashboard' && (
-        <div className="flex flex-1 min-h-screen">
+        <div className="flex h-screen overflow-hidden">
 
-          {/* Sidebar */}
-          <aside className="w-60 bg-zinc-950 border-r border-zinc-800 flex flex-col flex-shrink-0">
+          {/* Sidebar: stays fixed; scrolls on its own only if its content is taller than the screen */}
+          <aside className="w-60 h-screen sticky top-0 bg-zinc-950 border-r border-zinc-800 flex flex-col flex-shrink-0 overflow-y-auto">
             <div className="p-5">
               <div className="flex items-center gap-2.5 mb-7">
-                <div className="w-8 h-8 rounded-xl bg-gradient-to-tr from-indigo-600 to-violet-600 flex items-center justify-center flex-shrink-0">
-                  <Cpu className="w-4 h-4 text-white" />
-                </div>
+                <GapXLogo size={32} className="flex-shrink-0" />
                 <div>
                   <div className="text-sm font-bold">GapX AI</div>
                   <div className="text-[10px] text-zinc-500 uppercase tracking-widest">Premium</div>
@@ -3281,7 +2885,7 @@ public:
           </aside>
 
           {/* Main area */}
-          <main className="flex-1 flex flex-col overflow-hidden">
+          <main className="flex-1 flex flex-col overflow-hidden h-screen">
             {/* Topbar */}
             <header className="h-14 border-b border-zinc-800 px-6 flex items-center justify-between bg-zinc-950/80 backdrop-blur-sm sticky top-0 z-10 flex-shrink-0">
               <div className="flex items-center gap-3">
@@ -3294,8 +2898,12 @@ public:
               </div>
               <div className="flex items-center gap-2">
                 <button onClick={() => setThemeMode(t => t === 'dark' ? 'light' : 'dark')}
+                  title={themeMode === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+                  aria-label="Toggle light and dark mode"
                   className="p-2 border border-zinc-800 rounded-lg hover:bg-zinc-800 text-zinc-400 transition-colors">
-                  <RefreshCw className="w-3.5 h-3.5" />
+                  <motion.span key={themeMode} initial={{ rotate: -90, opacity: 0 }} animate={{ rotate: 0, opacity: 1 }} className="block">
+                    {themeMode === 'dark' ? <Sun className="w-3.5 h-3.5 text-amber-400" /> : <Moon className="w-3.5 h-3.5 text-indigo-400" />}
+                  </motion.span>
                 </button>
                 <button className="p-2 border border-zinc-800 rounded-lg hover:bg-zinc-800 text-zinc-400 transition-colors relative">
                   <Bell className="w-3.5 h-3.5" />
@@ -3313,6 +2921,14 @@ public:
 
             {/* Page content */}
             <div className="flex-1 overflow-y-auto p-6">
+              <AnimatePresence mode="wait">
+              <motion.div
+                key={sidebarTab}
+                initial={{ opacity: 0, x: 24 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: -24 }}
+                transition={{ duration: 0.28, ease: 'easeOut' }}
+              >
 
               {/* ── OVERVIEW / REAL-TIME ANALYTICS DASHBOARD ── */}
               {sidebarTab === 'overview' && (() => {
@@ -3864,14 +3480,26 @@ public:
                   <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                     <div>
                       <div className="flex items-center gap-2">
-                        <h3 className="text-base font-bold text-white">Dynamic 8-Stage Career Roadmap</h3>
-                        <span className="text-[10px] font-extrabold text-indigo-400 bg-indigo-500/10 px-2 py-0.5 rounded border border-indigo-500/20">AI Generated</span>
+                        <h3 className="text-base font-bold text-white">{roadmap?.stages_data?.length || 8}-Stage Preparation Roadmap</h3>
+                        <span className="text-[10px] font-extrabold text-indigo-400 bg-indigo-500/10 px-2 py-0.5 rounded border border-indigo-500/20">Role-Specific</span>
                       </div>
                       <p className="text-xs text-zinc-400 mt-1">
-                        Track: <span className="text-indigo-300 font-semibold">{roadmap?.target_role || userProfile?.target_roles?.[0] || 'Software Engineer'}</span> • Check off completed topics to gain <span className="text-green-400 font-bold">+50 XP</span> each
+                        Track: <span className="text-indigo-300 font-semibold">{roadmap?.target_role || userProfile?.target_roles?.[0] || 'Software Engineer'}</span> • Each topic has concepts, last-minute notes, a narrated explainer and video links • <span className="text-green-400 font-bold">+50 XP</span> per topic
+                        {roadmap?.estimated_completion_date && <> • Target finish: <span className="text-zinc-300 font-semibold">{roadmap.estimated_completion_date}</span></>}
                       </p>
                     </div>
-                    <div className="flex items-center gap-4 self-end sm:self-center">
+                    <div className="flex items-center gap-3 self-end sm:self-center flex-wrap justify-end">
+                      {roadmap?.stages_data && (
+                        <button
+                          type="button"
+                          disabled={cheatsheetLoading}
+                          onClick={downloadCheatsheet}
+                          className="px-3.5 py-2 bg-emerald-600/15 hover:bg-emerald-600 border border-emerald-500/30 text-emerald-300 hover:text-white rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
+                        >
+                          {cheatsheetLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
+                          {cheatsheetLoading ? 'Preparing...' : 'All Notes (PDF)'}
+                        </button>
+                      )}
                       <button
                         type="button"
                         disabled={roadmapLoading}
@@ -3879,7 +3507,7 @@ public:
                         className="px-3.5 py-2 bg-indigo-600/20 hover:bg-indigo-600 border border-indigo-500/30 text-indigo-300 hover:text-white rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 disabled:opacity-50 cursor-pointer shadow-sm"
                       >
                         {roadmapLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5" />}
-                        {roadmapLoading ? 'Generating...' : (roadmap?.stages_data ? 'Regenerate Roadmap' : 'Generate 8-Stage Roadmap')}
+                        {roadmapLoading ? 'Generating...' : (roadmap?.stages_data ? 'Refresh Roadmap' : 'Generate Roadmap')}
                       </button>
                       <div className="text-right pl-3 border-l border-zinc-800">
                         <div className="text-2xl font-extrabold text-white">{roadmap?.progress_percentage || 0}%</div>
@@ -3941,6 +3569,27 @@ public:
                                         {topic.is_completed && <span className="text-[9px] font-bold text-green-400 bg-green-500/10 px-1.5 py-0.5 rounded border border-green-500/20">+50 XP Earned</span>}
                                       </div>
                                       <p className="text-[11px] text-zinc-400 mt-1 leading-relaxed">{topic.description}</p>
+                                      {topic.already_familiar && !topic.is_completed && (
+                                        <span className="inline-block mt-1 text-[9px] font-bold text-sky-300 bg-sky-500/10 border border-sky-500/20 px-1.5 py-0.5 rounded">You listed this skill: a quick revision may be enough</span>
+                                      )}
+                                      {Array.isArray(topic.concepts) && topic.concepts.length > 0 && (
+                                        <div className="flex flex-wrap gap-1 mt-2">
+                                          {topic.concepts.map((c: string) => (
+                                            <span key={c} className="text-[10px] px-1.5 py-0.5 rounded-md bg-zinc-900 border border-zinc-700/70 text-zinc-300">{c}</span>
+                                          ))}
+                                        </div>
+                                      )}
+                                      {Array.isArray(topic.resources) && topic.resources.length > 0 && (
+                                        <div className="flex flex-wrap gap-x-3 gap-y-1 mt-2">
+                                          {topic.resources.map((r: any, idx: number) => (
+                                            <a key={idx} href={r.url} target="_blank" rel="noreferrer"
+                                              className={`text-[10.5px] font-semibold inline-flex items-center gap-1 hover:underline ${r.type === 'YouTube' ? 'text-red-400' : 'text-indigo-300'}`}>
+                                              {r.type === 'YouTube' ? <Youtube className="w-3.5 h-3.5" /> : <ExternalLink className="w-3 h-3" />}
+                                              {r.type === 'YouTube' ? r.title.replace(/^YouTube:\s*/, '') : r.title}
+                                            </a>
+                                          ))}
+                                        </div>
+                                      )}
                                     </div>
                                   </div>
                                   <div className="flex items-center gap-2 self-end sm:self-center flex-shrink-0">
@@ -3949,7 +3598,15 @@ public:
                                       onClick={() => openTopicNotes(stage.id, topic, stage.title)}
                                       className="px-3 py-1.5 bg-indigo-600/20 border border-indigo-500/30 text-indigo-300 hover:bg-indigo-600 hover:text-white text-[11px] font-bold rounded-lg transition-all flex items-center gap-1.5 cursor-pointer shadow-sm"
                                     >
-                                      <BookOpen className="w-3.5 h-3.5" /> Read Notes
+                                      <BookOpen className="w-3.5 h-3.5" /> Notes
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => openTopicNotes(stage.id, topic, stage.title, true)}
+                                      className="px-3 py-1.5 bg-fuchsia-600/15 border border-fuchsia-500/30 text-fuchsia-300 hover:bg-fuchsia-600 hover:text-white text-[11px] font-bold rounded-lg transition-all flex items-center gap-1.5 cursor-pointer"
+                                      title="Narrated, animated concept explainer"
+                                    >
+                                      <PlayCircle className="w-3.5 h-3.5" /> Explainer
                                     </button>
                                     <button
                                       type="button"
@@ -4640,7 +4297,18 @@ public:
 
                           {/* Professional Summary */}
                           <div>
-                            <label className="text-[11px] text-zinc-400 block mb-1 font-medium">Professional Summary</label>
+                            <div className="flex items-center justify-between mb-1">
+                              <label className="text-[11px] text-zinc-400 font-medium">Professional Summary (introduction)</label>
+                              <button
+                                type="button"
+                                onClick={generateResumeSummary}
+                                disabled={summaryLoading}
+                                className="text-[10px] font-bold text-indigo-300 bg-indigo-500/10 border border-indigo-500/30 hover:bg-indigo-600 hover:text-white px-2 py-0.5 rounded-lg flex items-center gap-1 transition-colors disabled:opacity-50 cursor-pointer"
+                              >
+                                {summaryLoading ? <Loader2 className="w-3 h-3 animate-spin" /> : <Wand2 className="w-3 h-3" />}
+                                {summaryLoading ? 'Writing...' : 'Write it for me'}
+                              </button>
+                            </div>
                             <textarea
                               rows={3}
                               value={resumeForm.summary}
@@ -4876,13 +4544,47 @@ public:
                               className="w-full bg-zinc-800 border border-zinc-700 rounded-xl p-3 text-xs text-white focus:outline-none focus:border-indigo-500 resize-none leading-relaxed"
                             />
                           </div>
+
+                          <div className="pt-3 border-t border-zinc-800 space-y-3">
+                            <div className="text-[11px] font-bold text-zinc-300">Second project (optional)</div>
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                              <input
+                                type="text"
+                                value={resumeForm.project2Title}
+                                onChange={e => setResumeForm({ ...resumeForm, project2Title: e.target.value })}
+                                placeholder="Project title"
+                                className="w-full bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-indigo-500"
+                              />
+                              <input
+                                type="text"
+                                value={resumeForm.project2Stack}
+                                onChange={e => setResumeForm({ ...resumeForm, project2Stack: e.target.value })}
+                                placeholder="Tech stack"
+                                className="w-full bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-indigo-500"
+                              />
+                            </div>
+                            <input
+                              type="url"
+                              value={resumeForm.project2Link}
+                              onChange={e => setResumeForm({ ...resumeForm, project2Link: e.target.value })}
+                              placeholder="https://github.com/username/another-project"
+                              className="w-full bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-indigo-500"
+                            />
+                            <textarea
+                              rows={2}
+                              value={resumeForm.project2Bullets}
+                              onChange={e => setResumeForm({ ...resumeForm, project2Bullets: e.target.value })}
+                              placeholder="• What you built and the measurable result (one per line)"
+                              className="w-full bg-zinc-800 border border-zinc-700 rounded-xl p-3 text-xs text-white focus:outline-none focus:border-indigo-500 resize-none leading-relaxed"
+                            />
+                          </div>
                         </div>
                       </div>
 
                       {/* Section 4: Certifications & Honors */}
                       <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 space-y-3.5">
                         <div className="text-xs font-bold uppercase tracking-wider text-white border-b border-zinc-800 pb-2">
-                          6. Certifications &amp; Honors
+                          6. Certifications, Honors &amp; Interests
                         </div>
 
                         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
@@ -4903,6 +4605,16 @@ public:
                               value={resumeForm.achievements}
                               onChange={e => setResumeForm({ ...resumeForm, achievements: e.target.value })}
                               placeholder="e.g. Smart India Hackathon Finalist, LeetCode Top 5% Global Ranking"
+                              className="w-full bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-indigo-500"
+                            />
+                          </div>
+                          <div className="sm:col-span-2">
+                            <label className="text-[11px] text-zinc-400 block mb-1 font-medium">Interests &amp; Hobbies (comma-separated)</label>
+                            <input
+                              type="text"
+                              value={resumeForm.interests}
+                              onChange={e => setResumeForm({ ...resumeForm, interests: e.target.value })}
+                              placeholder="e.g. Open-source contribution, Chess, Technical blogging, Robotics club"
                               className="w-full bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-indigo-500"
                             />
                           </div>
@@ -4935,186 +4647,115 @@ public:
                   {/* ── 3. STANDARD ATS RESUME DOCUMENT PREVIEW ── */}
                   {resumeMode === 'preview' && (
                     <div className="space-y-6">
-                      {/* Document Sheet Container */}
-                      <div className="bg-white text-slate-900 rounded-2xl p-8 sm:p-12 max-w-4xl mx-auto shadow-2xl font-sans border border-slate-200">
-                        {/* Header */}
-                        <div className="text-center pb-3">
-                          <h1 className="text-2xl font-extrabold tracking-tight text-slate-900">
-                            {resumeForm.name || userProfile?.full_name || 'Candidate'}
-                          </h1>
-                          <div className="text-xs font-bold text-indigo-700 mt-0.5 tracking-wide">
-                            {resumeForm.headline || userProfile?.target_roles?.[0] || 'Software Engineer'}
-                          </div>
-                          <div className="flex items-center justify-center gap-2 flex-wrap text-[11px] text-slate-600 mt-2">
-                            {(resumeForm.email || userProfile?.email) && (
-                              <span>{resumeForm.email || userProfile?.email}</span>
-                            )}
-                            {resumeForm.phone && (
-                              <>
-                                <span>•</span>
-                                <span>{resumeForm.phone}</span>
-                              </>
-                            )}
-                            {resumeForm.location && (
-                              <>
-                                <span>•</span>
-                                <span>{resumeForm.location}</span>
-                              </>
-                            )}
-                            {resumeForm.linkedin && (
-                              <>
-                                <span>•</span>
-                                <a href={resumeForm.linkedin} target="_blank" rel="noreferrer" className="text-indigo-600 hover:underline font-semibold">
-                                  LinkedIn
-                                </a>
-                              </>
-                            )}
-                            {resumeForm.github && (
-                              <>
-                                <span>•</span>
-                                <a href={resumeForm.github} target="_blank" rel="noreferrer" className="text-indigo-600 hover:underline font-semibold">
-                                  GitHub
-                                </a>
-                              </>
-                            )}
-                            {resumeForm.portfolio && (
-                              <>
-                                <span>•</span>
-                                <a href={resumeForm.portfolio} target="_blank" rel="noreferrer" className="text-indigo-600 hover:underline font-semibold">
-                                  Portfolio
-                                </a>
-                              </>
-                            )}
-                          </div>
-                        </div>
-
-                        {/* Divider */}
-                        <div className="border-t border-slate-300 my-3" />
-
-                        {/* Professional Summary */}
-                        {resumeForm.summary && (
-                          <div className="mb-4">
-                            <h2 className="text-xs font-bold uppercase tracking-wider text-slate-800 border-b border-slate-200 pb-1 mb-1.5">
-                              Professional Summary
-                            </h2>
-                            <p className="text-[11.5px] text-slate-700 leading-relaxed">
-                              {resumeForm.summary}
-                            </p>
-                          </div>
-                        )}
-
-                        {/* Education */}
-                        {(resumeForm.education || resumeForm.college) && (
-                          <div className="mb-4">
-                            <h2 className="text-xs font-bold uppercase tracking-wider text-slate-800 border-b border-slate-200 pb-1 mb-1.5">
-                              Education
-                            </h2>
-                            <div className="flex items-start justify-between">
-                              <div>
-                                <div className="text-[12px] font-bold text-slate-900">
-                                  {resumeForm.education || 'Degree / Major'}
+                      {/* A4 Document Sheet (210 × 297 mm), same single-column ATS layout as the PDF */}
+                      <div className="text-[11px] text-zinc-500 text-center -mb-3">A4 preview · single column · ATS friendly</div>
+                      <div className="overflow-x-auto pb-2">
+                      <div
+                        className="resume-sheet bg-white text-slate-900 mx-auto shadow-2xl font-sans border border-slate-200"
+                        style={{ width: '210mm', minHeight: '297mm', padding: '13mm 16mm' }}
+                      >
+                        {(() => {
+                          const list = (v: string) => v.split(',').map(x => x.trim()).filter(Boolean);
+                          const lines = (v: string) => v.split('\n').map(x => x.replace(/^[•\-*]\s*/, '').trim()).filter(Boolean);
+                          const clean = (u: string) => u.replace(/^https?:\/\/(www\.)?/, '').replace(/\/$/, '');
+                          const href = (u: string) => (u.startsWith('http') ? u : `https://${u}`);
+                          const Section = ({ title, children }: { title: string; children: React.ReactNode }) => (
+                            <div className="mt-3">
+                              <h2 className="text-[12px] font-bold uppercase tracking-wide text-slate-900">{title}</h2>
+                              <div className="border-t border-slate-900 mt-0.5 mb-1.5" />
+                              {children}
+                            </div>
+                          );
+                          const projects = [
+                            { t: resumeForm.project1Title, st: resumeForm.project1Stack, l: resumeForm.project1Link, b: resumeForm.project1Bullets },
+                            { t: resumeForm.project2Title, st: resumeForm.project2Stack, l: resumeForm.project2Link, b: resumeForm.project2Bullets },
+                          ].filter(pr => pr.t.trim());
+                          const contact = [resumeForm.phone, resumeForm.email || userProfile?.email, resumeForm.location].filter(Boolean) as string[];
+                          const links = [resumeForm.linkedin, resumeForm.github, resumeForm.portfolio].filter(Boolean) as string[];
+                          const skillRows: [string, string][] = ([
+                            ['Languages', resumeForm.languages], ['Frameworks & Libraries', resumeForm.frameworks],
+                            ['Tools & Platforms', resumeForm.tools], ['Core Skills', resumeForm.skills],
+                          ] as [string, string][]).filter(([, v]) => v.trim());
+                          return (
+                            <>
+                              <div className="text-center">
+                                <h1 className="text-[22px] font-bold leading-tight">{resumeForm.name || userProfile?.full_name || 'Your Name'}</h1>
+                                <div className="text-[12.5px] text-slate-600">{resumeForm.headline || userProfile?.target_roles?.[0] || 'Target Role'}</div>
+                                <div className="text-[10.5px] text-slate-600 mt-1">
+                                  {[...contact, ...links].map((c, i) => (
+                                    <span key={i}>
+                                      {i > 0 && <span className="mx-1.5">|</span>}
+                                      {links.includes(c) ? <a href={href(c)} target="_blank" rel="noreferrer" className="text-blue-700">{clean(c)}</a> : c}
+                                    </span>
+                                  ))}
                                 </div>
-                                {resumeForm.college && (
-                                  <div className="text-[11px] text-slate-600">
-                                    {resumeForm.college}
+                              </div>
+
+                              {resumeForm.summary && (
+                                <Section title="Professional Summary">
+                                  <p className="text-[11px] leading-relaxed">{resumeForm.summary}</p>
+                                </Section>
+                              )}
+
+                              {(resumeForm.education || resumeForm.college) && (
+                                <Section title="Education">
+                                  <div className="flex justify-between text-[11.5px]"><span className="font-bold">{resumeForm.education || 'Degree'}</span><span className="text-slate-600">{resumeForm.gradYear}</span></div>
+                                  <div className="text-[10.5px] italic text-slate-600">{[resumeForm.college, resumeForm.cgpa && `CGPA: ${resumeForm.cgpa}`].filter(Boolean).join(', ')}</div>
+                                </Section>
+                              )}
+
+                              {skillRows.length > 0 && (
+                                <Section title="Technical Skills">
+                                  {skillRows.map(([k, v]) => (
+                                    <div key={k} className="text-[11px] leading-relaxed"><span className="font-bold">{k}:</span> {list(v).join(', ')}</div>
+                                  ))}
+                                </Section>
+                              )}
+
+                              {projects.length > 0 && (
+                                <Section title="Projects">
+                                  {projects.map((pr, i) => (
+                                    <div key={i} className="mb-2">
+                                      <div className="text-[11.5px]"><span className="font-bold">{pr.t}</span>{pr.st && <span className="italic text-slate-600"> | {pr.st}</span>}</div>
+                                      {pr.l && <a href={href(pr.l)} target="_blank" rel="noreferrer" className="text-[10.5px] text-blue-700 italic">{clean(pr.l)}</a>}
+                                      <ul className="list-disc ml-4 text-[11px] leading-relaxed">{lines(pr.b).map((b, j) => <li key={j}>{b}</li>)}</ul>
+                                    </div>
+                                  ))}
+                                </Section>
+                              )}
+
+                              {resumeForm.experienceCompany && (
+                                <Section title="Experience">
+                                  <div className="flex justify-between text-[11.5px]">
+                                    <span><span className="font-bold">{resumeForm.experienceRole}</span> — {resumeForm.experienceCompany}</span>
+                                    <span className="text-slate-600">{resumeForm.experienceDuration}</span>
                                   </div>
-                                )}
-                              </div>
-                              <div className="text-right text-[11px] font-semibold text-slate-700">
-                                {resumeForm.gradYear && <div>{resumeForm.gradYear}</div>}
-                                {resumeForm.cgpa && <div className="text-slate-600 font-normal">CGPA: {resumeForm.cgpa}</div>}
-                              </div>
-                            </div>
-                          </div>
-                        )}
+                                  {resumeForm.experienceLocation && <div className="text-[10.5px] italic text-slate-600">{resumeForm.experienceLocation}</div>}
+                                  <ul className="list-disc ml-4 text-[11px] leading-relaxed">{lines(resumeForm.experienceBullets).map((b, j) => <li key={j}>{b}</li>)}</ul>
+                                </Section>
+                              )}
 
-                        {/* Technical Skills */}
-                        {(resumeForm.skills || resumeForm.languages || resumeForm.frameworks || resumeForm.tools) && (
-                          <div className="mb-4">
-                            <h2 className="text-xs font-bold uppercase tracking-wider text-slate-800 border-b border-slate-200 pb-1 mb-1.5">
-                              Technical Skills
-                            </h2>
-                            <div className="space-y-1 text-[11.5px] text-slate-700">
-                              {resumeForm.skills && (
-                                <div><span className="font-bold text-slate-900">Core Skills:</span> {resumeForm.skills}</div>
+                              {resumeForm.certifications.trim() && (
+                                <Section title="Certifications">
+                                  <ul className="list-disc ml-4 text-[11px] leading-relaxed">{list(resumeForm.certifications).map((c, i) => <li key={i}>{c}</li>)}</ul>
+                                </Section>
                               )}
-                              {resumeForm.languages && (
-                                <div><span className="font-bold text-slate-900">Languages:</span> {resumeForm.languages}</div>
-                              )}
-                              {resumeForm.frameworks && (
-                                <div><span className="font-bold text-slate-900">Frameworks &amp; Web Tech:</span> {resumeForm.frameworks}</div>
-                              )}
-                              {resumeForm.tools && (
-                                <div><span className="font-bold text-slate-900">Developer Tools, Cloud &amp; DBs:</span> {resumeForm.tools}</div>
-                              )}
-                            </div>
-                          </div>
-                        )}
 
-                        {/* Experience */}
-                        {resumeForm.experienceCompany && (
-                          <div className="mb-4">
-                            <h2 className="text-xs font-bold uppercase tracking-wider text-slate-800 border-b border-slate-200 pb-1 mb-1.5">
-                              Work Experience &amp; Internships
-                            </h2>
-                            <div className="flex items-start justify-between mb-1">
-                              <div>
-                                <span className="text-[12px] font-bold text-slate-900">{resumeForm.experienceRole}</span>
-                                <span className="text-[11.5px] text-slate-600"> — {resumeForm.experienceCompany}</span>
-                              </div>
-                              <div className="text-[11px] font-semibold text-slate-700">{resumeForm.experienceDuration}</div>
-                            </div>
-                            <ul className="list-disc list-inside text-[11px] text-slate-700 space-y-1">
-                              {resumeForm.experienceBullets.split('\n').filter(Boolean).map((b, i) => (
-                                <li key={i}>{b.replace(/^•\s*/, '')}</li>
-                              ))}
-                            </ul>
-                          </div>
-                        )}
-
-                        {/* Projects */}
-                        {resumeForm.project1Title && (
-                          <div className="mb-4">
-                            <h2 className="text-xs font-bold uppercase tracking-wider text-slate-800 border-b border-slate-200 pb-1 mb-1.5">
-                              Key Technical Projects
-                            </h2>
-                            <div className="flex items-start justify-between mb-1">
-                              <div>
-                                <span className="text-[12px] font-bold text-slate-900">{resumeForm.project1Title}</span>
-                                {resumeForm.project1Stack && (
-                                  <span className="text-[11px] text-slate-600 italic"> | {resumeForm.project1Stack}</span>
-                                )}
-                              </div>
-                              {resumeForm.project1Link && (
-                                <a href={resumeForm.project1Link} target="_blank" rel="noreferrer" className="text-[11px] font-semibold text-indigo-600 hover:underline">
-                                  View Repo
-                                </a>
+                              {resumeForm.achievements.trim() && (
+                                <Section title="Achievements">
+                                  <ul className="list-disc ml-4 text-[11px] leading-relaxed">{list(resumeForm.achievements).map((c, i) => <li key={i}>{c}</li>)}</ul>
+                                </Section>
                               )}
-                            </div>
-                            <ul className="list-disc list-inside text-[11px] text-slate-700 space-y-1">
-                              {resumeForm.project1Bullets.split('\n').filter(Boolean).map((b, i) => (
-                                <li key={i}>{b.replace(/^•\s*/, '')}</li>
-                              ))}
-                            </ul>
-                          </div>
-                        )}
 
-                        {/* Certifications & Honors */}
-                        {(resumeForm.certifications || resumeForm.achievements) && (
-                          <div>
-                            <h2 className="text-xs font-bold uppercase tracking-wider text-slate-800 border-b border-slate-200 pb-1 mb-1.5">
-                              Certifications &amp; Honors
-                            </h2>
-                            <ul className="list-disc list-inside text-[11px] text-slate-700 space-y-1">
-                              {resumeForm.certifications.split(',').map(s => s.trim()).filter(Boolean).map((c, i) => (
-                                <li key={`c-${i}`}><span className="font-semibold text-slate-900">Certification:</span> {c}</li>
-                              ))}
-                              {resumeForm.achievements.split(',').map(s => s.trim()).filter(Boolean).map((a, i) => (
-                                <li key={`a-${i}`}><span className="font-semibold text-slate-900">Honor / Award:</span> {a}</li>
-                              ))}
-                            </ul>
-                          </div>
-                        )}
+                              {resumeForm.interests.trim() && (
+                                <Section title="Interests">
+                                  <p className="text-[11px]">{list(resumeForm.interests).join(', ')}</p>
+                                </Section>
+                              )}
+                            </>
+                          );
+                        })()}
+                      </div>
                       </div>
 
                       {/* Action Bar */}
@@ -5380,8 +5021,7 @@ public:
                                 className="bg-zinc-900 border border-zinc-700 text-zinc-200 rounded-lg px-2.5 py-1 text-xs font-semibold focus:outline-none focus:border-indigo-500 cursor-pointer"
                               >
                                 <option value="python">Python 3</option>
-                                <option value="c">C (GCC 11)</option>
-                                <option value="cpp">C++ (GCC 11)</option>
+                                <option value="cpp">C++ (GCC, C++17)</option>
                                 <option value="java">Java (OpenJDK 17)</option>
                                 <option value="javascript">JavaScript (Node.js)</option>
                               </select>
@@ -5417,6 +5057,7 @@ public:
                           {/* Monaco Code Editor with Real-Time Syntax Validation */}
                           <div className="flex-1 w-full min-h-0">
                             <MonacoCodeEditor
+                              theme={themeMode}
                               code={editorCode}
                               language={editorLang}
                               onChange={(val) => {
@@ -5552,6 +5193,12 @@ public:
                                               <span className="text-zinc-500">Expected: </span>
                                               <code className="text-zinc-300">{codeOutput.test_results[activeTestCaseIdx].expected}</code>
                                             </div>
+                                            {codeOutput.test_results[activeTestCaseIdx].stdout && (
+                                              <div>
+                                                <span className="text-zinc-500">Your print output:</span>
+                                                <pre className="mt-1 p-2 bg-zinc-950 border border-zinc-800 rounded-lg text-zinc-300 whitespace-pre-wrap max-h-28 overflow-auto">{codeOutput.test_results[activeTestCaseIdx].stdout}</pre>
+                                              </div>
+                                            )}
                                           </div>
                                         )}
                                       </div>
@@ -5733,10 +5380,10 @@ public:
                           <Sparkles className="w-3.5 h-3.5" /> Real-Time AI Interview Room
                         </div>
                         <h2 className="text-2xl font-black text-white tracking-tight">
-                          Placement Simulation & Live Facial Telemetry
+                          Realistic Mock Interview for Your Field
                         </h2>
                         <p className="text-zinc-400 text-xs max-w-lg mx-auto leading-relaxed">
-                          Practice with an adaptive AI Interviewer equipped with real-time video emotion analysis, speech-to-text transcription, spoken follow-ups, and instant correction on flawed answers.
+                          A live, spoken interview that flows like the real thing: introduction, a deep-dive into your project, field-specific technical questions, a scenario, behavioral questions and your questions at the end. Every follow-up is based on what you actually say.
                         </p>
                       </div>
 
@@ -5831,36 +5478,46 @@ public:
                         </div>
                       </div>
 
-                      {/* Technical Topic Domain Focus */}
+                      {/* Field / job family */}
                       <div>
                         <label className="text-xs text-zinc-300 font-bold block mb-1.5 flex items-center justify-between">
                           <span className="flex items-center gap-1.5">
-                            <Sparkles className="w-3.5 h-3.5 text-amber-400" /> Technical Topic Focus (Live Adaptive Difficulty)
+                            <Sparkles className="w-3.5 h-3.5 text-amber-400" /> Field you're interviewing for
                           </span>
-                          <span className="text-[10px] text-amber-400/90 font-semibold">Adapts questions dynamically</span>
+                          <span className="text-[10px] text-amber-400/90 font-semibold">
+                            {topicDomain ? 'Questions tailored to this field' : 'Auto-detected from your target role'}
+                          </span>
                         </label>
-                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                          {[
-                            { id: 'AIML', label: '🤖 AIML Core', sub: 'LLMs, Overfitting, Vectors' },
-                            { id: 'DSA', label: '🧩 DSA & Algorithms', sub: 'HashMaps, Arrays, Trees' },
-                            { id: 'Fullstack', label: '🌐 Full Stack & APIs', sub: 'React, Next.js, FastAPI' },
-                            { id: 'CoreCS', label: '⚙️ Core CS & DB', sub: 'OS, DBMS, SQL, Networks' }
-                          ].map(t => (
+                        <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+                          {INTERVIEW_TRACKS.map(t => (
                             <button
                               key={t.id}
                               type="button"
-                              onClick={() => setTopicDomain(t.id)}
+                              onClick={() => { setTopicDomain(t.id); setTargetInterviewRole(t.label); }}
                               className={`p-2.5 rounded-xl border text-left transition-all cursor-pointer ${
                                 topicDomain === t.id
                                   ? 'bg-amber-500/10 border-amber-500/40 ring-1 ring-amber-500/30'
                                   : 'bg-zinc-950 border-zinc-800 hover:border-zinc-700'
                               }`}
                             >
-                              <div className="text-xs font-bold text-white flex items-center justify-between">
-                                <span>{t.label}</span>
-                                {topicDomain === t.id && <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />}
+                              <div className="text-xs font-bold text-white flex items-center justify-between gap-1">
+                                <span className="truncate">{t.icon} {t.label}</span>
+                                {topicDomain === t.id && <span className="w-1.5 h-1.5 rounded-full bg-amber-400 flex-shrink-0" />}
                               </div>
                               <div className="text-[9px] text-zinc-400 mt-1 truncate">{t.sub}</div>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      {/* Interview length */}
+                      <div className="flex items-center justify-between gap-3 flex-wrap">
+                        <span className="text-xs text-zinc-300 font-bold flex items-center gap-1.5"><Clock className="w-3.5 h-3.5 text-indigo-400" /> Interview length</span>
+                        <div className="flex gap-1.5">
+                          {[{ n: 6, label: 'Quick · ~15 min' }, { n: 8, label: 'Standard · ~25 min' }, { n: 10, label: 'Full · ~35 min' }].map(o => (
+                            <button key={o.n} type="button" onClick={() => setInterviewLength(o.n)}
+                              className={`px-2.5 py-1 rounded-lg text-[10px] font-bold border transition-colors cursor-pointer ${interviewLength === o.n ? 'bg-indigo-600 border-indigo-600 text-white' : 'border-zinc-700 text-zinc-400 hover:bg-zinc-800'}`}>
+                              {o.n} questions · {o.label.split(' · ')[1]}
                             </button>
                           ))}
                         </div>
@@ -5885,10 +5542,10 @@ public:
                         <div className="flex items-center gap-2 flex-wrap pt-1">
                           <span className="text-[10px] text-zinc-500 font-bold uppercase tracking-wider">Quick Presets:</span>
                           {[
-                            { label: '🤖 AIML Fresher / Student', role: 'AI / ML Engineer', domain: 'AIML', level: 'Fresher', jd: 'Fresher AI & ML Engineer with strong foundation in Generative AI, Prompt Engineering, Supervised vs Unsupervised Learning, Neural Networks, Overfitting prevention, and Python.' },
-                            { label: '🧩 Fresher SDE (DSA)', role: 'Software Engineer', domain: 'DSA', level: 'Fresher', jd: 'Entry-Level Software Development Engineer with strong problem-solving skills in HashMaps, Arrays, Two Pointers, Binary Search, Trees, and Big-O Time/Space complexity.' },
-                            { label: '🌐 Fullstack SDE', role: 'Full Stack Engineer', domain: 'Fullstack', level: 'Experienced', jd: 'Full Stack Engineer with React, Next.js, Node.js/FastAPI, PostgreSQL, Redis, REST APIs, and Docker.' },
-                            { label: '⚙️ Backend Systems', role: 'Backend Systems Engineer', domain: 'Fullstack', level: 'Experienced', jd: 'Backend Software Engineer skilled in Python/FastAPI, PostgreSQL, Redis distributed caching, RabbitMQ, and microservices architecture.' },
+                            { label: '🎨 Frontend Fresher', role: 'Frontend Engineer', domain: 'frontend', level: 'Fresher', jd: 'Frontend Developer (fresher) with HTML, CSS, JavaScript, TypeScript, React and Next.js, focused on accessibility and web performance.' },
+                            { label: '🤖 AI/ML Fresher', role: 'AI / ML Engineer', domain: 'ml', level: 'Fresher', jd: 'Junior ML Engineer with Python, PyTorch, scikit-learn, transformers, RAG and LLM application experience.' },
+                            { label: '🧩 SDE Fresher (DSA)', role: 'Software Engineer', domain: 'sde', level: 'Fresher', jd: 'Entry-level Software Engineer with strong data structures, algorithms, OOP, operating systems and SQL fundamentals.' },
+                            { label: '⚙️ Backend (Experienced)', role: 'Backend Engineer', domain: 'backend', level: 'Experienced', jd: 'Backend Engineer with Python/FastAPI or Node.js, PostgreSQL, Redis, Kafka, Docker and system design experience.' },
                           ].map(preset => (
                             <button
                               key={preset.label}
@@ -5981,17 +5638,11 @@ public:
                   {interviewStarted && (() => {
                     const interviewerMessages = interviewMessages.filter(m => m.role === 'interviewer');
                     const candidateMessages = interviewMessages.filter(m => m.role === 'candidate');
-                    const turnNumber = Math.min(5, Math.max(1, interviewerMessages.length));
                     const latestInterviewerMsg = interviewerMessages[interviewerMessages.length - 1];
-                    const currentQuestion = latestInterviewerMsg?.text || "Welcome to your technical interview session.";
-                    const stages = [
-                      "Candidate Background & Stack Alignment",
-                      "Core System Architecture Deep Dive",
-                      "Concurrency & Distributed Edge Cases",
-                      "20x High-Throughput Scaling",
-                      "Behavioral & Engineering Leadership"
-                    ];
-                    const currentRole = targetInterviewRole || userProfile?.target_roles?.[0] || 'Software Engineer';
+                    const currentQuestion = latestInterviewerMsg?.text || 'Welcome to your interview.';
+                    const currentRole = targetInterviewRole || interviewTrackLabel || userProfile?.target_roles?.[0] || 'Software Engineer';
+                    const kindLabel: Record<string, string> = { intro: 'Introduction', deep_dive: 'Project deep-dive', tech: 'Technical', scenario: 'Scenario', behavioral: 'Behavioral', closing: 'Your questions', 'follow-up': 'Follow-up' };
+                    const faceLabel = { off: 'Camera off', loading: 'Loading face analysis…', active: 'Face analysis on', 'no-face': 'Face not visible', unavailable: 'Face analysis unavailable' }[faceStatus];
 
                     return (
                       <motion.div
@@ -6016,7 +5667,7 @@ public:
                             <div>
                               <div className="flex items-center gap-2 flex-wrap">
                                 <h3 className="text-xs font-black text-white uppercase tracking-wider">
-                                  {currentRole} · Technical Round
+                                  {currentRole} · Mock Interview
                                 </h3>
                                 <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-indigo-500/10 border border-indigo-500/20 text-indigo-300">
                                   {interviewType} Interview
@@ -6029,7 +5680,7 @@ public:
                                   {experienceLevel === 'Fresher' ? '🎓 Fresher Track · Academic Focus' : '💼 Experienced Track'}
                                 </span>
                                 <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-500/10 border border-amber-500/30 text-amber-300">
-                                  {topicDomain === 'AIML' ? '🤖 AIML Track' : topicDomain === 'DSA' ? '🧩 DSA Track' : topicDomain}
+                                  {INTERVIEW_TRACKS.find(t => t.id === topicDomain)?.icon || '🎯'} {interviewTrackLabel || INTERVIEW_TRACKS.find(t => t.id === topicDomain)?.label || 'General'}
                                 </span>
                               </div>
                               <div className="flex items-center gap-2 text-[10px] text-zinc-400 mt-1">
@@ -6038,9 +5689,9 @@ public:
                                   <span className="font-mono">{formatDuration(callDuration)}</span>
                                 </span>
                                 <span>•</span>
-                                <span className="text-emerald-400 font-medium">1080p HD Live Stream</span>
+                                <span className="text-zinc-300 font-medium">This question: <span className="font-mono">{formatDuration(questionElapsed)}</span></span>
                                 <span>•</span>
-                                <span className="text-zinc-500">Google Meet / FAANG Panel Protocol</span>
+                                <span className={faceStatus === 'active' ? 'text-emerald-400' : 'text-zinc-500'}>{faceLabel}</span>
                               </div>
                             </div>
                           </div>
@@ -6050,23 +5701,26 @@ public:
                             {/* Segmented Stage Indicator */}
                             <div className="hidden sm:flex flex-col gap-1 min-w-[190px]">
                               <div className="flex justify-between text-[10px]">
-                                <span className="font-bold text-zinc-300">Stage {turnNumber} of 5</span>
-                                <span className="text-indigo-400 font-semibold">{stages[turnNumber - 1]}</span>
+                                <span className="font-bold text-zinc-300">Question {questionNumber} of {totalQuestions}</span>
+                                <span className="text-indigo-400 font-semibold truncate max-w-[130px]" title={interviewPhase}>
+                                  {questionKind === 'follow-up' ? '↳ Follow-up' : (kindLabel[questionKind] || interviewPhase)}
+                                </span>
                               </div>
-                              <div className="grid grid-cols-5 gap-1.5 h-1.5 w-full">
-                                {[1, 2, 3, 4, 5].map(step => (
+                              <div className="flex gap-1 h-1.5 w-full">
+                                {Array.from({ length: totalQuestions }, (_, i) => i + 1).map(step => (
                                   <div
                                     key={step}
-                                    className={`h-full rounded-full transition-all duration-500 ${
-                                      step < turnNumber
+                                    className={`flex-1 h-full rounded-full transition-all duration-500 ${
+                                      step < questionNumber
                                         ? 'bg-emerald-500'
-                                        : step === turnNumber
+                                        : step === questionNumber
                                         ? 'bg-indigo-500 animate-pulse'
                                         : 'bg-zinc-800'
                                     }`}
                                   />
                                 ))}
                               </div>
+                              <div className="text-[10px] text-zinc-500 truncate" title={interviewPhase}>Topic: {interviewPhase}</div>
                             </div>
 
                             {/* Live Dynamic Adaptive Difficulty Pill */}
@@ -6097,12 +5751,12 @@ public:
                             {/* Readiness & Confidence Telemetry Chips */}
                             <div className="flex items-center gap-2">
                               <div className="px-2.5 py-1 bg-zinc-950 border border-zinc-800 rounded-xl text-center">
-                                <div className="text-[9px] text-zinc-400 font-bold uppercase tracking-wider">Readiness</div>
-                                <div className="text-xs font-black text-emerald-400 font-mono">{liveInterviewScore}%</div>
+                                <div className="text-[9px] text-zinc-400 font-bold uppercase tracking-wider">Live score</div>
+                                <div className="text-xs font-black text-emerald-400 font-mono">{questionNumber > 1 && liveInterviewScore ? `${liveInterviewScore}%` : '—'}</div>
                               </div>
                               <div className="px-2.5 py-1 bg-zinc-950 border border-zinc-800 rounded-xl text-center">
                                 <div className="text-[9px] text-zinc-400 font-bold uppercase tracking-wider">Confidence</div>
-                                <div className="text-xs font-black text-indigo-400 font-mono">{liveConfidenceMetric}%</div>
+                                <div className="text-xs font-black text-indigo-400 font-mono">{liveConfidenceMetric ? `${liveConfidenceMetric}%` : '—'}</div>
                               </div>
                             </div>
 
@@ -6137,8 +5791,8 @@ public:
                                 <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
                                 <div>
                                   <div className="text-xs font-bold text-white flex items-center gap-1.5">
-                                    <span>Dr. Alex Vance</span>
-                                    <span className="text-[10px] text-zinc-400 font-normal">· FAANG Panel</span>
+                                    <span>Alex</span>
+                                    <span className="text-[10px] text-zinc-400 font-normal">· AI Interviewer</span>
                                   </div>
                                 </div>
                               </div>
@@ -6214,7 +5868,7 @@ public:
                               </div>
 
                               <div className="mt-2 text-[11px] font-semibold text-zinc-400">
-                                {isAiSpeaking ? 'Dr. Alex Vance is speaking...' : 'Evaluating candidate response...'}
+                                {isAiSpeaking ? 'Alex is speaking…' : loading ? 'Thinking about your answer…' : 'Listening. Take your time.'}
                               </div>
                             </div>
 
@@ -6222,10 +5876,10 @@ public:
                             <div className="relative z-10 flex items-center justify-between text-[11px] text-zinc-400 border-t border-zinc-800/80 pt-2.5">
                               <span className="flex items-center gap-1 text-[10px] text-zinc-400">
                                 <Cpu className="w-3 h-3 text-indigo-400" />
-                                Dynamic Adaptive Assessment
+                                Follow-ups adapt to your answers
                               </span>
                               <span className="text-[10px] font-mono text-zinc-500">
-                                Host Feed · Active
+                                {currentDifficulty} level
                               </span>
                             </div>
                           </div>
@@ -6301,12 +5955,12 @@ public:
                                 {/* Candidate Biometric HUD Badges (Frosted glass overlay) */}
                                 <div className="flex items-center gap-1.5 flex-wrap justify-end">
                                   <div className="bg-black/60 backdrop-blur-md border border-white/10 px-2.5 py-1 rounded-xl text-[10px] font-mono text-emerald-400 flex items-center gap-1">
-                                    <span>👁️ Gaze:</span>
-                                    <span className="font-bold">{Math.round(telemetry.eye)}%</span>
+                                    <span>👁️ Eye contact:</span>
+                                    <span className="font-bold">{faceStatus === 'active' ? `${Math.round(telemetry.eye)}%` : '—'}</span>
                                   </div>
                                   <div className="bg-black/60 backdrop-blur-md border border-white/10 px-2.5 py-1 rounded-xl text-[10px] font-mono text-indigo-400 flex items-center gap-1">
-                                    <span>🧠 Poise:</span>
-                                    <span className="font-bold">{Math.round(100 - telemetry.stress)}%</span>
+                                    <span>🧠 Composure:</span>
+                                    <span className="font-bold">{faceStatus === 'active' ? `${Math.round(100 - telemetry.stress)}%` : '—'}</span>
                                   </div>
                                   <div className="bg-black/60 backdrop-blur-md border border-white/10 px-2.5 py-1 rounded-xl text-[10px] font-mono text-amber-400 flex items-center gap-1">
                                     <span>⚡ {speechWpm} WPM</span>
@@ -6344,7 +5998,7 @@ public:
                               </div>
 
                               <span className="text-[10px] text-zinc-400 font-mono">
-                                FaceMesh Telemetry Active
+                                {faceLabel}
                               </span>
                             </div>
                           </div>
@@ -6372,11 +6026,11 @@ public:
                                     ) : isAiSpeaking ? (
                                       <span className="text-emerald-400 flex items-center gap-1">
                                         <Sparkles className="w-3 h-3 text-emerald-400 animate-spin" />
-                                        Dr. Alex Vance (Asking):
+                                        Alex (asking):
                                       </span>
                                     ) : (
                                       <span className="text-zinc-300">
-                                        Dr. Alex Vance (Current Question):
+                                        Alex (current question):
                                       </span>
                                     )}
                                   </div>
@@ -6422,6 +6076,22 @@ public:
                               </button>
                             </motion.div>
                           )}
+
+                          {/* Interview etiquette helpers (handled by the interviewer like in a real interview) */}
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="text-[10px] text-zinc-500 font-bold uppercase tracking-wider">Quick replies:</span>
+                            {[
+                              { label: '🔁 Repeat the question', text: 'Could you repeat the question?' },
+                              { label: '💡 Clarify / hint', text: 'Could you clarify what you mean? A hint would help.' },
+                              { label: '⏭️ Skip this one', text: "I don't know this one." },
+                            ].map(q => (
+                              <button key={q.label} type="button" disabled={loading} onClick={() => submitAnswerWithText(q.text)}
+                                className="px-2.5 py-1 rounded-lg text-[10px] font-semibold border border-zinc-700 text-zinc-300 hover:bg-zinc-800 disabled:opacity-40 cursor-pointer">
+                                {q.label}
+                              </button>
+                            ))}
+                            <span className="ml-auto text-[10px] text-zinc-500">Tip: think aloud and use examples from your projects.</span>
+                          </div>
 
                           {/* Candidate Answer Bar */}
                           <div className="flex gap-2 items-center">
@@ -6608,7 +6278,7 @@ public:
                                       }`}
                                     >
                                       <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-wider mb-1.5 opacity-80 border-b border-white/5 pb-1">
-                                        <span>{m.role === 'interviewer' ? '🤖 Dr. Alex Vance (Interviewer)' : `👤 ${userProfile?.full_name || 'Candidate'}`}</span>
+                                        <span>{m.role === 'interviewer' ? '🤖 Alex (Interviewer)' : `👤 ${userProfile?.full_name || 'Candidate'}`}</span>
                                         {m.role === 'interviewer' && (
                                           <button
                                             type="button"
@@ -6698,7 +6368,9 @@ public:
                         <div className="flex items-center gap-4 bg-zinc-950 border border-zinc-800 p-4 rounded-2xl">
                           <div className="text-right">
                             <div className="text-[10px] font-bold uppercase tracking-wider text-zinc-400">Readiness Score</div>
-                            <div className="text-xs text-emerald-400 font-bold">Top 10% Placement Ready</div>
+                            <div className={`text-xs font-bold ${interviewFeedback.overall_score >= 75 ? 'text-emerald-400' : interviewFeedback.overall_score >= 55 ? 'text-amber-400' : 'text-red-400'}`}>
+                              {interviewFeedback.overall_score >= 75 ? 'Interview ready' : interviewFeedback.overall_score >= 55 ? 'Getting there' : 'Needs more practice'}
+                            </div>
                           </div>
                           <div className="text-4xl font-black text-indigo-400 font-mono">
                             {interviewFeedback.overall_score}<span className="text-zinc-600 text-lg">/100</span>
@@ -6734,10 +6406,7 @@ public:
                             <CheckCircle className="w-4 h-4" /> Demonstrated Strengths
                           </div>
                           <div className="space-y-2">
-                            {(interviewFeedback.feedback?.strengths || [
-                              "Clear technical articulation aligned with JD requirements",
-                              "Strong foundational knowledge and sustained eye contact"
-                            ]).map((s: string, idx: number) => (
+                            {(interviewFeedback.feedback?.strengths || []).map((s: string, idx: number) => (
                               <div key={idx} className="text-xs text-zinc-300 bg-zinc-950/70 border border-zinc-800/80 p-2.5 rounded-xl flex items-start gap-2">
                                 <span className="text-emerald-400 font-bold">•</span>
                                 <span>{s}</span>
@@ -6752,10 +6421,7 @@ public:
                             <AlertCircle className="w-4 h-4" /> Areas for Technical Improvement
                           </div>
                           <div className="space-y-2">
-                            {(interviewFeedback.feedback?.mistakes || interviewFeedback.feedback?.weaknesses || [
-                              "State Big-O time and space complexity upfront before architectural details",
-                              "Contrast caching invalidation patterns (Cache-Aside vs Write-Through)"
-                            ]).map((m: string, idx: number) => (
+                            {([...(interviewFeedback.feedback?.weaknesses || []), ...(interviewFeedback.feedback?.suggestions || [])]).map((m: string, idx: number) => (
                               <div key={idx} className="text-xs text-zinc-300 bg-zinc-950/70 border border-zinc-800/80 p-2.5 rounded-xl flex items-start gap-2">
                                 <span className="text-amber-400 font-bold">⚠️</span>
                                 <span>{m}</span>
@@ -6771,11 +6437,7 @@ public:
                           <Compass className="w-4 h-4" /> 7-Day Custom Action Plan
                         </div>
                         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                          {(interviewFeedback.feedback?.practice_plan || [
-                            "Day 1-2: Review Distributed System Design patterns (Caching, Sharding)",
-                            "Day 3-4: Solve 5 LeetCode Medium problems on Tree/Graph algorithms",
-                            "Day 5-7: Re-take AI Mock Interview with live voice to build fluency"
-                          ]).map((plan: string, idx: number) => (
+                          {(interviewFeedback.feedback?.practice_plan || []).map((plan: string, idx: number) => (
                             <div key={idx} className="p-3 bg-zinc-950 border border-zinc-800 rounded-2xl">
                               <div className="text-[10px] font-bold text-indigo-400 uppercase">Milestone {idx + 1}</div>
                               <div className="text-xs text-zinc-200 mt-1 font-medium">{plan}</div>
@@ -6783,6 +6445,53 @@ public:
                           ))}
                         </div>
                       </div>
+
+                      {/* Question-by-question review */}
+                      {Array.isArray(interviewFeedback.feedback?.turns) && interviewFeedback.feedback.turns.length > 0 && (
+                        <div className="bg-zinc-900/90 border border-zinc-800 rounded-3xl p-5 shadow-xl space-y-3">
+                          <div className="text-xs font-bold uppercase tracking-wider text-violet-400 flex items-center gap-2">
+                            <MessageSquare className="w-4 h-4" /> Question-by-question review
+                          </div>
+                          {interviewFeedback.feedback.turns.map((t: any, idx: number) => {
+                            const ideal = (interviewFeedback.feedback?.ideal_answers || []).find((i: any) => i.question === t.question);
+                            return (
+                              <details key={idx} className="group bg-zinc-950/70 border border-zinc-800 rounded-2xl p-3">
+                                <summary className="flex items-center justify-between gap-3 cursor-pointer list-none">
+                                  <span className="text-xs text-zinc-200 font-semibold min-w-0">
+                                    <span className="text-zinc-500 mr-1">{t.is_followup ? '↳' : `${idx + 1}.`}</span>{t.topic}: <span className="font-normal text-zinc-400">{t.question.length > 90 ? t.question.slice(0, 90) + '…' : t.question}</span>
+                                  </span>
+                                  <span className={`text-xs font-black font-mono flex-shrink-0 ${t.score >= 72 ? 'text-emerald-400' : t.score >= 45 ? 'text-amber-400' : 'text-red-400'}`}>{t.score}</span>
+                                </summary>
+                                <div className="mt-2 space-y-2 text-[11px]">
+                                  <div className="text-zinc-400"><span className="font-bold text-zinc-300">Your answer:</span> {t.answer}</div>
+                                  {t.covered?.length > 0 && <div className="text-emerald-300">✓ Covered: {t.covered.join(', ')}</div>}
+                                  {t.missing?.length > 0 && <div className="text-amber-300">✗ Missed: {t.missing.join(', ')}</div>}
+                                  {ideal && <div className="text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-xl p-2"><span className="font-bold text-indigo-300">Model answer:</span> {ideal.ideal_answer}</div>}
+                                </div>
+                              </details>
+                            );
+                          })}
+                        </div>
+                      )}
+
+                      {/* Body language (only when face analysis ran) */}
+                      {interviewFeedback.behavior_scores?.aggregate?.has_face_data && (
+                        <div className="bg-zinc-900/90 border border-zinc-800 rounded-3xl p-5 shadow-xl space-y-3">
+                          <div className="text-xs font-bold uppercase tracking-wider text-sky-400 flex items-center gap-2">
+                            <Video className="w-4 h-4" /> Body language ({interviewFeedback.behavior_scores.aggregate.overall_behavior_rating})
+                          </div>
+                          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                            {[['Eye contact', 'avg_eye_contact'], ['Attention', 'avg_attention'], ['Smile', 'avg_smile'], ['Composure', 'avg_stress']].map(([label, key]) => (
+                              <div key={key} className="p-3 bg-zinc-950 border border-zinc-800 rounded-2xl text-center">
+                                <div className="text-[10px] text-zinc-400 font-bold uppercase">{label}</div>
+                                <div className="text-lg font-black text-white font-mono">{Math.round(key === 'avg_stress' ? 100 - interviewFeedback.behavior_scores.aggregate[key] : interviewFeedback.behavior_scores.aggregate[key])}%</div>
+                              </div>
+                            ))}
+                          </div>
+                          <p className="text-xs text-zinc-300">{interviewFeedback.behavior_scores.aggregate.body_language_feedback}</p>
+                          <p className="text-[10px] text-zinc-500">{interviewFeedback.behavior_scores.aggregate.disclaimer}</p>
+                        </div>
+                      )}
 
                       {/* Actions */}
                       <div className="flex items-center gap-3">
@@ -7042,10 +6751,15 @@ public:
                   </div>
                 </div>
               )}
+              </motion.div>
+              </AnimatePresence>
             </div>
           </main>
         </div>
       )}
+      </motion.div>
+      )}
+      </AnimatePresence>
 
       {/* ── INTERACTIVE DETAILED ACADEMIC STUDY NOTES MODAL ── */}
       <AnimatePresence>
@@ -7108,6 +6822,52 @@ public:
                   </div>
                 ) : activeNotes ? (
                   <>
+                    {/* Narrated concept explainer ("video lesson") */}
+                    <div className="space-y-2">
+                      <button type="button" onClick={() => setExplainerOpen(o => !o)}
+                        className="w-full flex items-center justify-between px-4 py-2.5 rounded-xl bg-fuchsia-500/10 border border-fuchsia-500/30 text-fuchsia-200 text-xs font-bold cursor-pointer">
+                        <span className="flex items-center gap-2"><PlayCircle className="w-4 h-4" /> Concept explainer: an animated, narrated lesson for this topic</span>
+                        {explainerOpen ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                      </button>
+                      {explainerOpen && <ConceptPlayer notes={activeNotes} topicTitle={activeNotes.title || selectedNotesTopic.title} />}
+                    </div>
+
+                    {/* Last-minute revision notes */}
+                    {Array.isArray(activeNotes.last_minute_notes) && activeNotes.last_minute_notes.length > 0 && (
+                      <div className="bg-emerald-950/20 border border-emerald-500/25 rounded-xl p-5">
+                        <div className="flex items-center gap-2 text-emerald-400 text-xs font-bold uppercase tracking-wider mb-2">
+                          <Zap className="w-4 h-4" /> Last-minute notes
+                        </div>
+                        <ul className="space-y-1.5">
+                          {activeNotes.last_minute_notes.map((n: string, i: number) => (
+                            <li key={i} className="text-xs sm:text-sm text-zinc-200 leading-relaxed flex gap-2"><span className="text-emerald-400">•</span><span>{renderInlineMarkdown(n)}</span></li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+
+                    {/* Videos & documentation */}
+                    {activeNotes.resources && ((activeNotes.resources.videos || []).length + (activeNotes.resources.docs || []).length) > 0 && (
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        {(activeNotes.resources.videos || []).length > 0 && (
+                          <div className="bg-zinc-950/70 border border-zinc-800 rounded-xl p-4">
+                            <div className="flex items-center gap-2 text-red-400 text-xs font-bold uppercase tracking-wider mb-2"><Youtube className="w-4 h-4" /> Video lessons</div>
+                            {activeNotes.resources.videos.map((v: any, i: number) => (
+                              <a key={i} href={v.url} target="_blank" rel="noreferrer" className="block text-xs text-zinc-200 hover:text-red-300 py-1 hover:underline">▶ {v.title}</a>
+                            ))}
+                          </div>
+                        )}
+                        {(activeNotes.resources.docs || []).length > 0 && (
+                          <div className="bg-zinc-950/70 border border-zinc-800 rounded-xl p-4">
+                            <div className="flex items-center gap-2 text-indigo-400 text-xs font-bold uppercase tracking-wider mb-2"><ExternalLink className="w-4 h-4" /> Read the docs</div>
+                            {activeNotes.resources.docs.map((d: any, i: number) => (
+                              <a key={i} href={d.url} target="_blank" rel="noreferrer" className="block text-xs text-zinc-200 hover:text-indigo-300 py-1 hover:underline">{d.title}</a>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
                     {/* 1. Executive Definition & Overview */}
                     <div className="bg-zinc-950/70 border border-zinc-800 rounded-xl p-5">
                       <div className="flex items-center gap-2 text-indigo-400 text-xs font-bold uppercase tracking-wider mb-2">

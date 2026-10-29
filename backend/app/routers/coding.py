@@ -6,6 +6,7 @@ from app.core.database import get_db
 from app.core.security import get_current_user
 from app.services.judge0 import CodeExecutionService
 from app.services.ai_service import AIService
+from app.services.gamification import record_activity
 import random
 
 router = APIRouter(prefix="/coding", tags=["Coding Practice Module"])
@@ -34,6 +35,16 @@ def list_problems(
         ) for p in problems
     ]
 
+def public_problem(p: models.CodingProblem) -> schemas.CodingProblemBase:
+    """Problem details without hidden test cases."""
+    data = schemas.CodingProblemBase.model_validate(p, from_attributes=True).model_dump()
+    tests = p.test_cases or []
+    data["test_cases"] = [{"input": t.get("input", ""), "output": t.get("output", "")} for t in tests if not t.get("is_hidden")]
+    data["hidden_test_count"] = sum(1 for t in tests if t.get("is_hidden"))
+    data["company_tags"] = p.company_tags or []
+    data["hints"] = p.hints or []
+    return schemas.CodingProblemBase(**data)
+
 @router.get("/problems/{prob_id}", response_model=schemas.CodingProblemBase)
 def get_problem(
     prob_id: int,
@@ -43,7 +54,7 @@ def get_problem(
     p = db.query(models.CodingProblem).filter(models.CodingProblem.id == prob_id).first()
     if not p:
         raise HTTPException(status_code=404, detail="Problem not found")
-    return p
+    return public_problem(p)
 
 @router.post("/problems/{prob_id}/run", response_model=schemas.CodeSubmitResponse)
 def run_code(
@@ -62,7 +73,7 @@ def run_code(
         public_tcs = p.test_cases[:2] # Fallback to first two
         
     # Execute code
-    res = CodeExecutionService.execute_code(req.code, req.language, public_tcs)
+    res = CodeExecutionService.execute_code(req.code, req.language, public_tcs, p.signature)
     
     return schemas.CodeSubmitResponse(
         status=res["status"],
@@ -86,12 +97,12 @@ def submit_code(
         raise HTTPException(status_code=404, detail="Problem not found")
         
     # Run against ALL test cases (public and hidden)
-    res = CodeExecutionService.execute_code(req.code, req.language, p.test_cases)
+    res = CodeExecutionService.execute_code(req.code, req.language, p.test_cases, p.signature)
     
     # Analyze code if there are bugs, using AI service
     ai_feedback = None
     if res["status"] != "Accepted":
-        hint_res = AIService.get_coding_hint(p.title, p.problem_statement, req.code, req.language)
+        hint_res = AIService.get_coding_hint(p.title, p.problem_statement, req.code, req.language, p.hints, p.editorial)
         ai_feedback = f"Hint: {hint_res.get('hint')}\nApproach: {hint_res.get('approach')}"
         
     # Save submission record
@@ -121,7 +132,7 @@ def submit_code(
         if not prev_solved:
             xp_reward = 100 if p.difficulty == "Hard" else (50 if p.difficulty == "Medium" else 30)
             current_user.xp += xp_reward
-            current_user.streak += 1 # Increment streak
+            record_activity(current_user)
             
             # Level up check
             new_lvl = (current_user.xp // 500) + 1
@@ -206,6 +217,8 @@ def save_code_draft(
             models.CodingDraft.language == req.language
         ).first()
         
+    if not db.query(models.CodingProblem.id).filter(models.CodingProblem.id == prob_id).first():
+        raise HTTPException(status_code=404, detail="Problem not found")
     if draft:
         draft.code = req.code
     else:
@@ -249,7 +262,7 @@ def get_smart_ai_hint(
     # If code is provided and hint_level >= 2, run AI code inspection
     code_analysis = None
     if req.code and len(req.code.strip()) > 30:
-        hint_res = AIService.get_coding_hint(p.title, p.problem_statement, req.code, req.language)
+        hint_res = AIService.get_coding_hint(p.title, p.problem_statement, req.code, req.language, p.hints, p.editorial)
         code_analysis = hint_res.get("hint") or hint_res.get("approach")
         
     approach_desc = p.editorial or f"Use standard {p.category} technique to achieve {p.expected_time_complexity} time."
@@ -306,5 +319,5 @@ def start_coding_test(
     return schemas.CodingTestResponse(
         test_id=test_id,
         duration_minutes=req.duration_minutes,
-        problems=test_problems
+        problems=[public_problem(p) for p in test_problems]
     )

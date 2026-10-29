@@ -18,13 +18,15 @@ interface MonacoCodeEditorProps {
   language: string; // 'python' | 'javascript' | 'java' | 'cpp'
   onChange: (newCode: string) => void;
   onSyntaxErrorChange?: (errors: SyntaxErrorItem[]) => void;
+  theme?: 'dark' | 'light';
 }
 
 export default function MonacoCodeEditor({
   code,
   language,
   onChange,
-  onSyntaxErrorChange
+  onSyntaxErrorChange,
+  theme = 'dark'
 }: MonacoCodeEditorProps) {
   const editorRef = useRef<any>(null);
   const monacoRef = useRef<any>(null);
@@ -237,7 +239,7 @@ export default function MonacoCodeEditor({
           height="100%"
           language={getMonacoLanguage(language)}
           value={code}
-          theme="vs-dark"
+          theme={theme === 'light' ? 'vs' : 'vs-dark'}
           onChange={(val) => onChange(val || '')}
           onMount={handleEditorDidMount}
           options={{
