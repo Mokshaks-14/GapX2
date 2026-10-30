@@ -749,7 +749,16 @@ def _run(cmd: List[str], cwd: str, stdin: str = "", timeout: float = TIME_LIMIT)
         kwargs["preexec_fn"] = _limits
     elif os.name == "nt":
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    proc = subprocess.run(cmd, **kwargs)
+    # On Windows, antivirus briefly locks a freshly compiled .exe while scanning it ("Access is denied").
+    # Wait a moment and try again instead of failing the student's run.
+    for attempt in range(10):
+        try:
+            proc = subprocess.run(cmd, **kwargs)
+            break
+        except PermissionError:
+            if os.name != "nt" or attempt == 9:
+                raise
+            time.sleep(0.2 + 0.2 * attempt)
     proc.stdout = (proc.stdout or "")[:MAX_OUTPUT]
     proc.stderr = (proc.stderr or "")[:MAX_OUTPUT]
     return proc
