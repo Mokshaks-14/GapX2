@@ -38,3 +38,6 @@ frontend/.env.local
 .DS_Store
 Thumbs.db
 *.log
+
+# Cached text-to-speech audio
+backend/tts_cache/

@@ -11,6 +11,8 @@ class User(Base):
     password_hash = Column(String, nullable=False)
     full_name = Column(String, nullable=True)
     is_admin = Column(Boolean, default=False)
+    is_active = Column(Boolean, default=True)          # admins can disable an account
+    last_login_at = Column(DateTime, nullable=True)
     
     # Onboarding properties
     role = Column(String, default="Student")  # Student, Working Professional, Career Switcher
@@ -22,6 +24,8 @@ class User(Base):
     preferred_learning_hours = Column(Integer, default=2)
     expected_placement_date = Column(String, nullable=True)
     target_roles = Column(JSON, default=list) # e.g. ["Software Engineer", "Frontend Developer"]
+    # Everything entered during onboarding (college, CGPA, company, links, project, interests...)
+    profile_details = Column(JSON, default=dict)
     
     # Gamification
     xp = Column(Integer, default=0)
@@ -110,6 +114,9 @@ class CodingProblem(Base):
     editorial = Column(Text, nullable=True)
     # How the test runner calls the solution: {"fn": "twoSum", "params": [["nums", "int[]"], ...], "returns": "int[]"}
     signature = Column(JSON, nullable=True)
+    # Problems added from the admin panel (built-in ones come from the problem bank)
+    is_custom = Column(Boolean, default=False)
+    created_by = Column(String, nullable=True)
     
     submissions = relationship("CodingSubmission", back_populates="problem", cascade="all, delete-orphan")
 
@@ -187,3 +194,48 @@ class Notification(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     
     user = relationship("User", back_populates="notifications")
+
+
+class EmailVerification(Base):
+    """One-time sign-up codes (stored hashed)."""
+    __tablename__ = "email_verifications"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, unique=True, index=True, nullable=False)
+    code_hash = Column(String, nullable=True)
+    expires_at = Column(DateTime, nullable=True)
+    attempts = Column(Integer, default=0)
+    last_sent_at = Column(DateTime, nullable=True)
+    window_start = Column(DateTime, nullable=True)
+    sends_in_window = Column(Integer, default=0)
+
+
+class InterviewQuestion(Base):
+    """Technical interview questions added from the admin panel; merged into the question bank."""
+    __tablename__ = "interview_questions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    track = Column(String, index=True, nullable=False)      # frontend, backend, sde, ...
+    topic = Column(String, nullable=False)
+    level = Column(String, default="Medium")                 # Easy, Medium, Hard
+    question = Column(Text, nullable=False)
+    key_points = Column(JSON, default=list)                  # [["hash map", "dictionary", "hashmap"], ...]
+    ideal_answer = Column(Text, nullable=False)
+    hint = Column(Text, nullable=True)
+    created_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class AuditLog(Base):
+    """Security and activity events shown in the admin panel."""
+    __tablename__ = "audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    category = Column(String, index=True, nullable=False)   # auth, interview, integrity, coding, resume, admin
+    event = Column(String, nullable=False)                   # e.g. login_failed, phone_detected
+    severity = Column(String, default="info", index=True)    # info, warning, critical
+    user_id = Column(Integer, nullable=True, index=True)
+    user_email = Column(String, nullable=True, index=True)
+    ip_address = Column(String, nullable=True)
+    details = Column(JSON, default=dict)

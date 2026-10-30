@@ -2,20 +2,25 @@ import logging
 import secrets
 
 import requests
-from fastapi import APIRouter, Depends, HTTPException, status
+from datetime import datetime
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app import models, schemas
 from app.core import security
 from app.core.config import settings
 from app.core.database import get_db
+from app.services import email_verification
+from app.services.audit import log_event
+from app.services.email_check import validate_signup_email
+from app.services.validation import name_problem, password_problem
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 GOOGLE_TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo"
 GOOGLE_ISSUERS = {"accounts.google.com", "https://accounts.google.com"}
-DEMO_EMAIL = "demo@gapx.ai"
 
 
 def _sync_admin_flag(user: models.User, db: Session) -> None:
@@ -35,24 +40,62 @@ def _token_response(user: models.User) -> dict:
     }
 
 
-def demo_login_enabled() -> bool:
-    return settings.ALLOW_DEMO_LOGIN and not settings.is_production
-
-
 @router.get("/config")
 def auth_config():
     """Tells the frontend which sign-in options are available."""
     return {
         "google_client_id": settings.GOOGLE_CLIENT_ID or None,
-        "demo_login_enabled": demo_login_enabled(),
+        "email_verification": settings.EMAIL_VERIFICATION_REQUIRED,
     }
 
 
+@router.post("/check-email")
+def check_email(payload: schemas.EmailCheckRequest, db: Session = Depends(get_db)):
+    """Tells the sign-in screen whether to ask for a password (existing user) or show registration."""
+    email = payload.email.strip().lower()
+    if "@" not in email or "." not in email.split("@")[-1]:
+        raise HTTPException(status_code=400, detail="Please enter a valid email address.")
+    exists = db.query(models.User).filter(models.User.email == email).first() is not None or         db.query(models.User).filter(models.User.email == payload.email.strip()).first() is not None
+    if not exists and settings.EMAIL_DOMAIN_CHECK:
+        problem = validate_signup_email(email)
+        if problem:
+            log_event("auth", "signup_email_rejected", email=email, severity="warning", details={"reason": problem})
+            raise HTTPException(status_code=400, detail=problem)
+    return {"exists": exists}
+
+
+@router.post("/send-code")
+def send_verification_code(payload: schemas.EmailCheckRequest, db: Session = Depends(get_db)):
+    """Emails a 6-digit code that proves the person owns the address (needed to register)."""
+    email = payload.email.strip().lower()
+    if db.query(models.User).filter(models.User.email == email).first():
+        raise HTTPException(status_code=400, detail="An account with this email already exists. Please sign in.")
+    if settings.EMAIL_DOMAIN_CHECK:
+        problem = validate_signup_email(email)
+        if problem:
+            raise HTTPException(status_code=400, detail=problem)
+    ok, message = email_verification.send_code(db, email)
+    if not ok:
+        raise HTTPException(status_code=429 if "wait" in message or "Too many" in message else 400, detail=message)
+    return {"sent": True, "message": message, "dev_mode": not email_verification.smtp_configured()}
+
+
 @router.post("/register", response_model=schemas.Token)
-def register(user_in: schemas.UserCreate, db: Session = Depends(get_db)):
+def register(user_in: schemas.UserCreate, request: Request, db: Session = Depends(get_db)):
     email = user_in.email.strip().lower()
     if db.query(models.User).filter(models.User.email == email).first():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="A user with this email already exists.")
+    if settings.EMAIL_DOMAIN_CHECK:
+        problem = validate_signup_email(email)
+        if problem:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=problem)
+    problem = name_problem(user_in.full_name or "") or password_problem(user_in.password, email, user_in.full_name or "")
+    if problem:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=problem)
+    if settings.EMAIL_VERIFICATION_REQUIRED:
+        problem = email_verification.check_code(db, email, user_in.verification_code or "")
+        if problem:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=problem)
 
     user = models.User(
         email=email,
@@ -63,18 +106,27 @@ def register(user_in: schemas.UserCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(user)
     _sync_admin_flag(user, db)
+    log_event("auth", "signup", user=user, request=request, details={"method": "email + verification code" if settings.EMAIL_VERIFICATION_REQUIRED else "email"})
     return _token_response(user)
 
 
 @router.post("/login", response_model=schemas.Token)
-def login(user_in: schemas.UserLogin, db: Session = Depends(get_db)):
+def login(user_in: schemas.UserLogin, request: Request, db: Session = Depends(get_db)):
     email = user_in.email.strip().lower()
     # Older accounts may have been stored with mixed-case emails
     user = db.query(models.User).filter(models.User.email == email).first() or \
         db.query(models.User).filter(models.User.email == user_in.email.strip()).first()
     if not user or not security.verify_password(user_in.password, user.password_hash):
+        log_event("auth", "login_failed", email=email, severity="warning", request=request,
+                  details={"reason": "unknown email" if not user else "wrong password"})
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Incorrect email or password.")
+    if user.is_active is False:
+        log_event("auth", "login_blocked", user=user, severity="warning", request=request, details={"reason": "account disabled"})
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This account has been disabled. Please contact support.")
     _sync_admin_flag(user, db)
+    user.last_login_at = datetime.utcnow()
+    db.commit()
+    log_event("auth", "login", user=user, request=request)
     return _token_response(user)
 
 
@@ -98,7 +150,7 @@ def _verify_google_credential(credential: str) -> dict:
 
 
 @router.post("/google", response_model=schemas.Token)
-def google_login(payload: schemas.GoogleLoginRequest, db: Session = Depends(get_db)):
+def google_login(payload: schemas.GoogleLoginRequest, request: Request, db: Session = Depends(get_db)):
     """Signs in with a Google ID token produced by Google Identity Services on the frontend."""
     info = _verify_google_credential(payload.credential)
     email = info["email"].lower()
@@ -114,23 +166,11 @@ def google_login(payload: schemas.GoogleLoginRequest, db: Session = Depends(get_
         db.add(user)
         db.commit()
         db.refresh(user)
+    if user.is_active is False:
+        log_event("auth", "login_blocked", user=user, severity="warning", request=request, details={"reason": "account disabled", "method": "google"})
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This account has been disabled. Please contact support.")
     _sync_admin_flag(user, db)
-    return _token_response(user)
-
-
-@router.post("/demo", response_model=schemas.Token)
-def demo_login(db: Session = Depends(get_db)):
-    """One-click demo account for local development. Disabled in production."""
-    if not demo_login_enabled():
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Demo login is disabled.")
-    user = db.query(models.User).filter(models.User.email == DEMO_EMAIL).first()
-    if not user:
-        user = models.User(
-            email=DEMO_EMAIL,
-            password_hash=security.get_password_hash(secrets.token_urlsafe(32)),
-            full_name="Demo Student",
-        )
-        db.add(user)
-        db.commit()
-        db.refresh(user)
+    user.last_login_at = datetime.utcnow()
+    db.commit()
+    log_event("auth", "login", user=user, request=request, details={"method": "google"})
     return _token_response(user)

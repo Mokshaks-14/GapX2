@@ -1,6 +1,9 @@
 from datetime import datetime, timedelta
+from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -9,12 +12,35 @@ from app.core.database import get_db
 from app.core.security import get_current_user
 from app.services.behavior_analyzer import BehaviorAnalyzer
 from app.services.interview_bank import TRACKS
+from app.services import tts
+from app.services.audit import log_event
 from app.services.interview_engine import InterviewEngine
 from app.services.gamification import record_activity
 
 router = APIRouter(prefix="/interviews", tags=["AI Mock Interviews"])
 
 MAX_XP_INTERVIEWS_PER_DAY = 2
+
+
+def _candidate_profile(db: Session, user: models.User) -> dict:
+    """Profile details that personalise the interview (from onboarding and the latest resume)."""
+    details = user.profile_details or {}
+    profile = {
+        "skills": list(dict.fromkeys((user.skills or []) + (user.languages_known or []))),
+        "college": details.get("college_name"),
+        "company": details.get("current_company"),
+        "project_title": details.get("project_title"),
+        "project_stack": details.get("project_stack"),
+        "project_description": details.get("project_description"),
+    }
+    if not profile["project_title"]:
+        resume = db.query(models.Resume).filter(models.Resume.user_id == user.id).order_by(models.Resume.created_at.desc()).first()
+        projects = ((resume.resume_data or {}).get("projects") or []) if resume else []
+        first = next((p for p in projects if isinstance(p, dict) and (p.get("name") or p.get("title"))), None)
+        if first:
+            profile["project_title"] = first.get("name") or first.get("title")
+            profile["project_stack"] = first.get("stack") or first.get("technologies")
+    return profile
 
 
 @router.get("/tracks")
@@ -34,6 +60,7 @@ def start_interview(req: schemas.InterviewStartRequest, db: Session = Depends(ge
         job_description=(req.job_description or "").strip(),
         candidate_name=current_user.full_name,
         length=req.num_questions or 8,
+        profile=_candidate_profile(db, current_user),
     )
     state = started["state"]
     interview = models.MockInterview(
@@ -48,10 +75,13 @@ def start_interview(req: schemas.InterviewStartRequest, db: Session = Depends(ge
     db.add(interview)
     db.commit()
     db.refresh(interview)
+    log_event("interview", "started", user=current_user, details={"interview_id": interview.id, "role": state["role"], "type": interview.interview_type})
+    for part in started["speech_parts"]:
+        tts.warm(part)
     return schemas.InterviewStartResponse(
         interview_id=interview.id, first_question=started["question"], speech_text=started["question"],
         difficulty=started["difficulty"], phase=started["phase"], track=state["track"],
-        track_label=state["track_label"], total_questions=started["total_questions"],
+        track_label=state["track_label"], total_questions=started["total_questions"], speech_parts=started["speech_parts"],
     )
 
 
@@ -94,6 +124,7 @@ def submit_interview_answer(interview_id: int, req: schemas.InterviewMessageRequ
     telemetry = list((interview.behavior_scores or {}).get("telemetry_log", []))
     frame["wpm"] = req.wpm_metric
     frame["filler_words"] = req.filler_words_count
+    frame["integrity_events"] = [e for e in (req.integrity_events or []) if e in ("multiple_faces", "background_motion", "face_missing", "phone_detected", "tab_switch", "fullscreen_exit", "paste_attempt")][:20]
     telemetry.append(frame)
 
     result = InterviewEngine.answer(state, req.answer, {"wpm": req.wpm_metric, "face": frame if frame.get("has_face_data") else None})
@@ -113,7 +144,10 @@ def submit_interview_answer(interview_id: int, req: schemas.InterviewMessageRequ
         final = dict(report["feedback"])
         final.update({"engine": state, "job_description": state.get("job_description", "")})
         interview.feedback = final
-        interview.behavior_scores = {"telemetry_log": telemetry, "aggregate": behavior}
+        from app.services.behavior_analyzer import integrity_report
+        live_events = list((interview.behavior_scores or {}).get("integrity_events", []))
+        integ = integrity_report(telemetry, live_events)
+        interview.behavior_scores = {"telemetry_log": telemetry, "aggregate": behavior, "integrity": integ, "integrity_events": live_events}
         xp = _award_xp(db, current_user, interview, answered)
         final["xp_awarded"] = xp
         interview.feedback = final
@@ -124,16 +158,56 @@ def submit_interview_answer(interview_id: int, req: schemas.InterviewMessageRequ
             type="Interview",
         ))
         result["current_live_score"] = interview.overall_score
+        log_event("interview", "completed", user=current_user, severity="warning" if integ["flagged"] else "info",
+                  details={"interview_id": interview.id, "score": interview.overall_score, "integrity_flagged": integ["flagged"],
+                           "integrity": integ["counts"]})
     else:
         store["engine"] = state
         interview.feedback = store
-        interview.behavior_scores = {"telemetry_log": telemetry}
+        interview.behavior_scores = {"telemetry_log": telemetry,
+                                     "integrity_events": list((interview.behavior_scores or {}).get("integrity_events", []))}
 
     for field in ("transcript", "feedback", "behavior_scores"):
         flag_modified(interview, field)
     db.commit()
 
+    # Start generating the interviewer's voice now, so it's (nearly) ready when the browser asks for it
+    for part in (result.get("speech_parts") or [result.get("speech_text_to_speak")]):
+        if part:
+            tts.warm(part)
     return schemas.InterviewMessageResponse(**{k: v for k, v in result.items() if k in schemas.InterviewMessageResponse.model_fields})
+
+
+INTEGRITY_TYPES = ("multiple_faces", "background_motion", "face_missing", "phone_detected", "tab_switch", "fullscreen_exit", "paste_attempt")
+
+
+class IntegrityEvent(BaseModel):
+    type: str
+    question_number: Optional[int] = None
+
+
+@router.post("/{interview_id}/integrity")
+def report_integrity_event(interview_id: int, body: IntegrityEvent, request: Request, db: Session = Depends(get_db),
+                           current_user: models.User = Depends(get_current_user)):
+    """Called by the browser the moment a proctoring warning happens (logged and stored immediately)."""
+    if body.type not in INTEGRITY_TYPES:
+        raise HTTPException(status_code=400, detail="Unknown integrity event")
+    interview = db.query(models.MockInterview).filter(
+        models.MockInterview.id == interview_id, models.MockInterview.user_id == current_user.id).first()
+    if not interview:
+        raise HTTPException(status_code=404, detail="Interview session not found")
+    scores = dict(interview.behavior_scores or {})
+    events = list(scores.get("integrity_events", []))
+    if len(events) < 300:
+        events.append({"type": body.type, "question": body.question_number, "at": datetime.utcnow().isoformat(timespec="seconds")})
+    scores["integrity_events"] = events
+    interview.behavior_scores = scores
+    flag_modified(interview, "behavior_scores")
+    db.commit()
+    log_event("integrity", body.type, user=current_user, request=request,
+              severity="critical" if body.type in ("phone_detected", "multiple_faces") else "warning",
+              details={"interview_id": interview_id, "question": body.question_number})
+    return {"ok": True}
 
 
 def _serialize(interview: models.MockInterview) -> dict:

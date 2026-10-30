@@ -157,6 +157,26 @@ def generate_resume_summary(resume_in: schemas.ManualResumeCreate, current_user:
         data["headline"] = current_user.target_roles[0]
     return {"summary": AIService.write_resume_summary(data)}
 
+@router.post("/jd-match")
+def job_description_match(req: schemas.JDMatchRequest, db: Session = Depends(get_db),
+                          current_user: models.User = Depends(get_current_user)):
+    """How well the resume (current form, or the latest saved one) matches a pasted job description."""
+    from app.services.jd_match import match
+    if len((req.job_description or "").strip()) < 30:
+        raise HTTPException(status_code=400, detail="Paste the full job description (at least a few lines).")
+    resume = req.resume.model_dump() if req.resume else None
+    if resume is None:
+        latest = db.query(models.Resume).filter(models.Resume.user_id == current_user.id).order_by(models.Resume.created_at.desc()).first()
+        if latest:
+            resume = latest.resume_data or {}
+        else:  # no saved resume yet: use what was entered during onboarding
+            d = current_user.profile_details or {}
+            resume = {"headline": (current_user.target_roles or [""])[0], "skills": current_user.skills or [],
+                      "languages": current_user.languages_known or [], "education": current_user.education,
+                      "projects": [{"name": d.get("project_title"), "stack": d.get("project_stack"),
+                                    "bullets": (d.get("project_description") or "").splitlines()}] if d.get("project_title") else []}
+    return match(resume, req.job_description)
+
 @router.post("/download-pdf")
 def download_resume_pdf_post(
     resume_in: schemas.ManualResumeCreate,

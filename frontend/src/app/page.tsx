@@ -14,7 +14,9 @@ import {
 import { motion, AnimatePresence } from 'framer-motion';
 import MonacoCodeEditor from './MonacoCodeEditor';
 import GapXLogo from './GapXLogo';
+import AuthShowcase from './AuthShowcase';
 import ConceptPlayer from './ConceptPlayer';
+import { speakParts, stopSpeaking, SPEEDS, getSpeed, setSpeed, onSpeedChange, isQuotaReached, onVoiceNotice } from './voice';
 import { startFaceAnalysis, FaceMetrics } from './faceAnalysis';
 import {
   ResponsiveContainer, BarChart, Bar, Cell,
@@ -24,6 +26,40 @@ import {
 
 const BACKEND_URL = (process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000') + '/api/v1';
 const INITIAL_PROBLEMS: any[] = [];
+
+// ── Sign-up & onboarding rules (the backend enforces the same ones) ──
+const COMMON_PASSWORDS = ['password', 'password1', 'password123', '123456', '12345678', '123456789', 'qwerty', 'qwerty123', 'abc123',
+  'iloveyou', 'admin', 'admin123', 'welcome', 'letmein', 'passw0rd', 'p@ssw0rd', 'india123', 'test1234', 'changeme'];
+const PASSWORD_RULES: { label: string; test: (p: string) => boolean }[] = [
+  { label: 'At least 8 characters', test: p => p.length >= 8 },
+  { label: 'An uppercase letter (A–Z)', test: p => /[A-Z]/.test(p) },
+  { label: 'A lowercase letter (a–z)', test: p => /[a-z]/.test(p) },
+  { label: 'A number (0–9)', test: p => /\d/.test(p) },
+  { label: 'A special character (! @ # $ …)', test: p => /[^A-Za-z0-9]/.test(p) },
+  { label: 'No spaces', test: p => p.length > 0 && !/\s/.test(p) },
+];
+function passwordProblem(pw: string, email: string, name: string): string | null {
+  const missing = PASSWORD_RULES.filter(r => !r.test(pw)).map(r => r.label.toLowerCase());
+  if (missing.length) return `Password needs: ${missing.join(', ')}.`;
+  const low = pw.toLowerCase();
+  if (COMMON_PASSWORDS.includes(low) || COMMON_PASSWORDS.includes(low.replace(/[^a-z]/g, ''))) return 'That password is too common. Choose something harder to guess.';
+  const local = email.split('@')[0].toLowerCase();
+  if (local.length >= 4 && low.includes(local)) return "Password shouldn't contain your email address.";
+  if (name.toLowerCase().split(/\s+/).some(part => part.length >= 4 && low.includes(part))) return "Password shouldn't contain your name.";
+  if (/(.)\1{3,}/.test(pw)) return "Password shouldn't repeat the same character 4+ times.";
+  return null;
+}
+function passwordStrength(pw: string): { score: number; label: string; color: string } {
+  const passed = PASSWORD_RULES.filter(r => r.test(pw)).length + (pw.length >= 12 ? 1 : 0);
+  if (!pw) return { score: 0, label: '', color: 'bg-zinc-700' };
+  if (passed <= 3) return { score: 1, label: 'Weak', color: 'bg-red-500' };
+  if (passed <= 5) return { score: 2, label: 'Fair', color: 'bg-amber-500' };
+  if (passed === 6) return { score: 3, label: 'Strong', color: 'bg-emerald-500' };
+  return { score: 4, label: 'Very strong', color: 'bg-emerald-400' };
+}
+const NAME_RE = /^[A-Za-z][A-Za-z .'\-]{1,59}$/;
+const LINKEDIN_RE = /^(https?:\/\/)?(www\.|[a-z]{2}\.)?linkedin\.com\/in\/[A-Za-z0-9_\-%.]{3,100}\/?$/i;
+const GITHUB_RE = /^(https?:\/\/)?(www\.)?github\.com\/[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/?$/i;
 
 const INTERVIEW_TRACKS = [
   { id: 'frontend', label: 'Frontend Engineer', icon: '🎨', sub: 'HTML/CSS, JS, React, performance' },
@@ -39,10 +75,10 @@ const INTERVIEW_TRACKS = [
 ];
 
 type AppState = 'splash' | 'auth' | 'onboarding' | 'dashboard';
-type AuthMode = 'login' | 'register';
+type AuthMode = 'email' | 'login' | 'register';
 type SidebarTab = 'overview' | 'roadmap' | 'resume' | 'coding' | 'interview' | 'mentor' | 'admin' | 'profile';
 
-interface Message { role: string; text: string; }
+interface Message { role: string; text: string; spoken?: string; }
 interface UserProfile {
   id: number; email: string; full_name: string; role: string;
   education: string; semester: string; skills: string[];
@@ -50,6 +86,7 @@ interface UserProfile {
   preferred_learning_hours: number; expected_placement_date: string;
   target_roles: string[]; xp: number; level: number; streak: number;
   badges: string[]; created_at: string;
+  profile_details?: Record<string, any> | null;
 }
 function safeArray(val: any): any[] {
   if (!val) return [];
@@ -168,7 +205,17 @@ function MarkdownChatBubble({ text }: { text: string }) {
 
 export default function GapXApp() {
   const [appState, setAppState] = useState<AppState>('splash');
-  const [authMode, setAuthMode] = useState<AuthMode>('login');
+  const [authMode, setAuthMode] = useState<AuthMode>('email');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [codeSent, setCodeSent] = useState(false);
+  const [verificationCode, setVerificationCode] = useState('');
+  const [codeInfo, setCodeInfo] = useState('');
+  const [resendIn, setResendIn] = useState(0);
+  useEffect(() => {
+    if (resendIn <= 0) return;
+    const t = setTimeout(() => setResendIn(r => r - 1), 1000);
+    return () => clearTimeout(t);
+  }, [resendIn]);
   const [sidebarTab, setSidebarTab] = useState<SidebarTab>('overview');
   const [themeMode, setThemeMode] = useState<'dark' | 'light'>('dark');
   const themeLoadedRef = useRef(false);
@@ -184,6 +231,7 @@ export default function GapXApp() {
 
   // Onboarding
   const [onboardStep, setOnboardStep] = useState(1);
+  const [onboardErrors, setOnboardErrors] = useState<string[]>([]);
   const [customSkill, setCustomSkill] = useState('');
   const [onboardData, setOnboardData] = useState({
     role: 'Student', // 'Student' | 'Working Professional' | 'Career Switcher'
@@ -217,7 +265,18 @@ export default function GapXApp() {
     experienceLevel: 'Beginner',
     learningHours: 3,
     expectedPlacement: 'June 2026',
-    targetRoles: ['Software Engineer'] as string[]
+    targetRoles: ['Software Engineer'] as string[],
+
+    // Profile details that flow into the resume, roadmap and interview
+    phone: '',
+    location: '',
+    linkedin: '',
+    github: '',
+    portfolio: '',
+    projectTitle: '',
+    projectStack: '',
+    projectDescription: '',
+    interests: ''
   });
 
   // Data
@@ -232,6 +291,7 @@ export default function GapXApp() {
   const [copiedCode, setCopiedCode] = useState(false);
   const [codingProblems, setCodingProblems] = useState<any[]>(INITIAL_PROBLEMS);
   const [activeProblem, setActiveProblem] = useState<any>(INITIAL_PROBLEMS[0] || null);
+  const clipLogRef = useRef(0);
   const [editorLang, setEditorLang] = useState('python');
   const [editorCode, setEditorCode] = useState(INITIAL_PROBLEMS[0]?.starter_code_python || '# Write solution here\n');
   const [codeOutput, setCodeOutput] = useState<any>(null);
@@ -293,28 +353,48 @@ export default function GapXApp() {
     project2Bullets: ''
   });
   const [summaryLoading, setSummaryLoading] = useState(false);
+  const [jdText, setJdText] = useState('');
+  const [jdResult, setJdResult] = useState<any>(null);
+  const [jdLoading, setJdLoading] = useState(false);
+  const [dailyChallenge, setDailyChallenge] = useState<any>(null);
 
   // Automatically sync profile and onboarding data directly into resume builder
   const syncResumeWithProfile = useCallback((prof?: UserProfile | null, onboard?: typeof onboardData) => {
+    // Everything entered at sign-up/onboarding flows into the resume (only empty fields are filled)
     setResumeForm(prev => {
+      const pd: Record<string, any> = prof?.profile_details || {};
       const skillsArr = (prof?.skills && prof.skills.length > 0) ? prof.skills : (onboard?.skills || []);
       const langsArr = (prof?.languages_known && prof.languages_known.length > 0) ? prof.languages_known : (onboard?.languages || []);
       const targetRole = (prof?.target_roles && prof.target_roles.length > 0) ? prof.target_roles[0] : (onboard?.targetRoles?.[0] || '');
-      const eduVal = prof?.education || onboard?.degreeBranch || '';
+      const degree = pd.degree_branch || pd.highest_degree || onboard?.degreeBranch || prof?.education || '';
+      const interests = Array.isArray(pd.interests) ? pd.interests.join(', ') : (onboard?.interests || '');
+      const projectBullets = (pd.project_description || onboard?.projectDescription || '')
+        .split('\n').map((l: string) => l.trim()).filter(Boolean).map((l: string) => (l.startsWith('•') ? l : `• ${l}`)).join('\n');
+      const fill = (current: string, ...candidates: any[]) => current || (candidates.find(c => c !== undefined && c !== null && String(c).trim() !== '') ?? '').toString();
 
       return {
         ...prev,
-        name: prev.name || prof?.full_name || fullName || '',
-        email: prev.email || prof?.email || email || '',
-        headline: prev.headline || targetRole || '',
-        skills: prev.skills || (skillsArr.length > 0 ? skillsArr.join(', ') : ''),
-        languages: prev.languages || (langsArr.length > 0 ? langsArr.join(', ') : ''),
-        education: prev.education || eduVal || '',
-        college: prev.college || onboard?.collegeName || '',
-        cgpa: prev.cgpa || (onboard?.cgpa ? String(onboard.cgpa) : ''),
-        gradYear: prev.gradYear || onboard?.gradYear || '',
-        experienceCompany: prev.experienceCompany || onboard?.currentCompany || '',
-        experienceRole: prev.experienceRole || onboard?.currentDesignation || '',
+        name: fill(prev.name, prof?.full_name, fullName),
+        email: fill(prev.email, prof?.email, email),
+        headline: fill(prev.headline, targetRole),
+        phone: fill(prev.phone, pd.phone, onboard?.phone),
+        location: fill(prev.location, pd.location, onboard?.location),
+        linkedin: fill(prev.linkedin, pd.linkedin, onboard?.linkedin),
+        github: fill(prev.github, pd.github, onboard?.github),
+        portfolio: fill(prev.portfolio, pd.portfolio, onboard?.portfolio),
+        skills: fill(prev.skills, skillsArr.join(', ')),
+        languages: fill(prev.languages, langsArr.join(', ')),
+        education: fill(prev.education, degree),
+        college: fill(prev.college, pd.college_name, onboard?.collegeName),
+        cgpa: fill(prev.cgpa, pd.cgpa, onboard?.cgpa),
+        gradYear: fill(prev.gradYear, pd.graduation_year, onboard?.gradYear),
+        experienceCompany: fill(prev.experienceCompany, pd.current_company, onboard?.currentCompany),
+        experienceRole: fill(prev.experienceRole, pd.current_company ? pd.current_designation : '', onboard?.currentCompany ? onboard?.currentDesignation : ''),
+        experienceDuration: fill(prev.experienceDuration, pd.current_company ? pd.years_of_experience : ''),
+        project1Title: fill(prev.project1Title, pd.project_title, onboard?.projectTitle),
+        project1Stack: fill(prev.project1Stack, pd.project_stack, onboard?.projectStack),
+        project1Bullets: fill(prev.project1Bullets, projectBullets),
+        interests: fill(prev.interests, interests),
       };
     });
   }, [fullName, email]);
@@ -327,6 +407,8 @@ export default function GapXApp() {
   const [interviewStarted, setInterviewStarted] = useState(false);
   const [interviewMessages, setInterviewMessages] = useState<any[]>([]);
   const [candidateResponse, setCandidateResponse] = useState('');
+  const candidateTextRef = useRef('');
+  useEffect(() => { candidateTextRef.current = candidateResponse; }, [candidateResponse]);
   const [interviewFeedback, setInterviewFeedback] = useState<any>(null);
   const [currentTurnCorrection, setCurrentTurnCorrection] = useState<any>(null);
   const [liveInterviewScore, setLiveInterviewScore] = useState(82);
@@ -340,6 +422,14 @@ export default function GapXApp() {
   const [audioLevel, setAudioLevel] = useState<number>(0);
   const [telemetry, setTelemetry] = useState({ attention: 0, smile: 0, stress: 0, eye: 0 });
   const [faceStatus, setFaceStatus] = useState<'off' | 'loading' | 'active' | 'no-face' | 'unavailable'>('off');
+  // Integrity (anti-cheating) monitoring during the interview
+  const integrityRef = useRef({ pending: [] as string[], counts: { multiple_faces: 0, background_motion: 0, face_missing: 0, phone_detected: 0, tab_switch: 0, fullscreen_exit: 0, paste_attempt: 0 } as Record<string, number>,
+    last: {} as Record<string, number>, streak: { multi: 0, motion: 0, none: 0, phone: 0 } });
+  const [integrityAlert, setIntegrityAlert] = useState<string | null>(null);
+  const [integrityCounts, setIntegrityCounts] = useState<Record<string, number>>({ multiple_faces: 0, background_motion: 0, face_missing: 0, phone_detected: 0, tab_switch: 0, fullscreen_exit: 0, paste_attempt: 0 });
+  const [fsBlocked, setFsBlocked] = useState(false);
+  const interviewLiveRef = useRef(false);
+  const cameraWantedRef = useRef(false);
   const faceSamplesRef = useRef<FaceMetrics[]>([]);
   const [interviewLength, setInterviewLength] = useState(8);
   const [interviewPhase, setInterviewPhase] = useState('Introduction');
@@ -406,44 +496,35 @@ export default function GapXApp() {
   const silenceTimerRef = useRef<any>(null);
   const recognitionRef = useRef<any>(null);
   const [audioOutputEnabled, setAudioOutputEnabled] = useState(true);
-
-  // --- SPLASH + RESTORE SESSION (token is verified with the server) ---
+  // Auto mic: the microphone opens by itself as soon as the interviewer finishes speaking
+  const [autoMic, setAutoMic] = useState(true);
+  const autoMicRef = useRef(true);
   useEffect(() => {
-    const t = setTimeout(async () => {
-      let saved: any = null;
-      try { saved = JSON.parse(localStorage.getItem('gapx_session') || 'null'); } catch (_) {}
-      try { localStorage.removeItem('gapx_users'); } catch (_) {}  // old offline accounts stored plain-text passwords
-      const tok: string | undefined = saved?.token;
-      if (tok && !tok.startsWith('local_')) {
-        try {
-          const r = await fetch(`${BACKEND_URL}/users/me`, { headers: { Authorization: `Bearer ${tok}` } });
-          if (r.ok) {
-            const prof = await r.json();
-            setToken(tok);
-            setUserProfile(prof);
-            saveSession(tok, prof);
-            if (prof.email) setEmail(prof.email);
-            if (prof.full_name) setFullName(prof.full_name);
-            syncResumeWithProfile(prof);
-            setAppState(prof.education && prof.target_roles?.length ? 'dashboard' : 'onboarding');
-            fetchRoadmap(tok); fetchProblems(tok); fetchNotifications(tok); fetchResume(tok); fetchReadiness(tok); fetchInterview(tok);
-            return;
-          }
-          if (r.status === 401) setErrorMessage('Your session has expired. Please sign in again.');
-        } catch (_) {
-          setErrorMessage(`Can't reach the GapX server at ${BACKEND_URL.replace('/api/v1', '')}. Start the backend (run_app.bat) and refresh.`);
-        }
-      }
-      localStorage.removeItem('gapx_session');
+    try { if (localStorage.getItem('gapx_auto_mic') === 'off') { setAutoMic(false); autoMicRef.current = false; } } catch (_) {}
+  }, []);
+  const toggleAutoMic = () => {
+    const next = !autoMicRef.current;
+    autoMicRef.current = next;
+    setAutoMic(next);
+    try { localStorage.setItem('gapx_auto_mic', next ? 'on' : 'off'); } catch (_) {}
+  };
+  const wantListenRef = useRef(false);          // true while the mic should stay on (restarts after silence)
+  const startRecRef = useRef<(resume?: boolean) => void>(() => {});
+
+
+  // --- SPLASH, then always the sign-in screen (no automatic login when the app is opened) ---
+  useEffect(() => {
+    try { localStorage.removeItem('gapx_session'); localStorage.removeItem('gapx_users'); } catch (_) {}
+    const t = setTimeout(() => {
       setAppState('auth');
-      setAuthMode('login');
+      setAuthMode('email');
       setPassword('');
     }, 1900);
     return () => clearTimeout(t);
   }, []);
 
-  // --- SIGN-IN OPTIONS (Google / demo) ---
-  const [authConfig, setAuthConfig] = useState<{ google_client_id: string | null; demo_login_enabled: boolean }>({ google_client_id: null, demo_login_enabled: false });
+  // --- SIGN-IN OPTIONS (Google) ---
+  const [authConfig, setAuthConfig] = useState<{ google_client_id: string | null; email_verification?: boolean }>({ google_client_id: null, email_verification: true });
   const googleBtnRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     fetch(`${BACKEND_URL}/auth/config`).then(r => r.ok ? r.json() : null).then(d => d && setAuthConfig(d)).catch(() => {});
@@ -501,31 +582,38 @@ export default function GapXApp() {
   }, [activeProblem, editorCode, editorLang, saveCodeDraft]);
 
   // --- AUDIO OUTPUT (TEXT-TO-SPEECH WITH AI AVATAR PULSE) ---
-  const speakInterviewerText = (text: string) => {
-    if (!audioOutputEnabled) return;
-    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-      try {
-        window.speechSynthesis.cancel();
-        const utterance = new SpeechSynthesisUtterance(text);
-        utterance.rate = 1.02;
-        utterance.pitch = 1.0;
-        
-        const voices = window.speechSynthesis.getVoices();
-        const prefVoice = voices.find(v => v.lang.includes('en') && (
-          v.name.includes('Natural') || v.name.includes('Google') || v.name.includes('Neural') || v.name.includes('Jenny') || v.name.includes('Guy') || v.name.includes('Samantha') || v.name.includes('Zira')
-        )) || voices.find(v => v.lang.includes('en'));
-        
-        if (prefVoice) utterance.voice = prefVoice;
-        
-        utterance.onstart = () => { setIsAiSpeaking(true); };
-        utterance.onend = () => { setIsAiSpeaking(false); };
-        utterance.onerror = () => { setIsAiSpeaking(false); };
-        
-        window.speechSynthesis.speak(utterance);
-      } catch (_) {
-        setIsAiSpeaking(false);
-      }
+  const [voiceLoading, setVoiceLoading] = useState(false);
+  const [voiceSpeed, setVoiceSpeed] = useState(1);
+  useEffect(() => { setVoiceSpeed(getSpeed()); return onSpeedChange(setVoiceSpeed); }, []);
+  const [voiceQuota, setVoiceQuota] = useState(false);
+  useEffect(() => { setVoiceQuota(isQuotaReached()); return onVoiceNotice(setVoiceQuota); }, []);
+  // Opens the mic for the candidate's answer (if auto mic is on and the interview is still running)
+  const autoListen = (force = false) => {
+    if (!interviewLiveRef.current || (!autoMicRef.current && !force)) return;
+    setTimeout(() => {
+      if (interviewLiveRef.current && !isAiSpeakingRef.current && !recognitionRef.current) startRecRef.current(false);
+    }, 300);
+  };
+
+  const speakInterviewerText = (text: string, parts?: string[], listenAfter = false) => {
+    if (!text) return;
+    // Never record the interviewer's own voice
+    const wasRecording = !!recognitionRef.current;
+    if (wasRecording) stopVoiceRecording();
+    if (!audioOutputEnabled) {
+      if (listenAfter || wasRecording) autoListen(wasRecording);
+      return;
     }
+    setVoiceLoading(true);
+    isAiSpeakingRef.current = true;
+    speakParts(BACKEND_URL, token, parts && parts.length ? parts : [text], { onStart: () => { setVoiceLoading(false); setIsAiSpeaking(true); } })
+      .finally(async () => {
+        setVoiceLoading(false); setIsAiSpeaking(false); isAiSpeakingRef.current = false;
+        const queued = pendingWarningRef.current;
+        pendingWarningRef.current = null;
+        if (queued && interviewLiveRef.current) await sayWarning(queued);
+        if (listenAfter || wasRecording) autoListen(wasRecording);
+      });
   };
 
   // --- THEME ---
@@ -553,6 +641,7 @@ export default function GapXApp() {
       setFaceStatus('loading');
       try {
         stop = await startFaceAnalysis(video, m => {
+          if (interviewLiveRef.current) trackIntegrity(m);
           if (!m.facePresent) { setFaceStatus('no-face'); return; }
           setFaceStatus('active');
           faceSamplesRef.current.push(m);
@@ -574,6 +663,132 @@ export default function GapXApp() {
     const iv = setInterval(() => setQuestionElapsed(Math.floor((Date.now() - questionStartRef.current) / 1000)), 1000);
     return () => clearInterval(iv);
   }, [interviewStarted]);
+
+  const INTEGRITY_MESSAGES: Record<string, string> = {
+    multiple_faces: 'Another person is visible on camera. Make sure you are alone during the interview.',
+    background_motion: 'Movement detected in the background. Please make sure nobody is helping you.',
+    face_missing: 'Your face is not visible. Please stay in front of the camera.',
+    phone_detected: 'A mobile phone was detected. Please keep phones away during the interview.',
+    tab_switch: 'You switched to another tab or app. Stay on the interview until it ends.',
+    fullscreen_exit: 'You left full screen. The interview continues only in full screen.',
+    paste_attempt: 'Pasting answers is not allowed. Please answer in your own words.',
+  };
+  // What the interviewer says out loud for each warning (short, so the audio is quick and cached)
+  const INTEGRITY_SPOKEN: Record<string, string> = {
+    multiple_faces: "I can see someone else in the frame. Please make sure you're alone.",
+    phone_detected: 'I noticed a phone. Please put it away so we can continue fairly.',
+    background_motion: "I'm seeing movement behind you. Please make sure nobody is helping you.",
+    face_missing: "I can't see you right now. Please come back in front of the camera.",
+    tab_switch: 'It looks like you switched away. Please stay on the interview screen.',
+    fullscreen_exit: 'Please return to full screen to continue the interview.',
+    paste_attempt: 'Please answer in your own words instead of pasting.',
+  };
+  const pendingWarningRef = useRef<string | null>(null);
+  // Always-current values for listeners that were registered earlier (camera, full screen)
+  const liveRef = useRef({ interviewId: null as number | null, question: 1, token: null as string | null, audio: true });
+  useEffect(() => { liveRef.current = { interviewId, question: questionNumber, token, audio: audioOutputEnabled }; },
+    [interviewId, questionNumber, token, audioOutputEnabled]);
+  const isAiSpeakingRef = useRef(false);
+  useEffect(() => { isAiSpeakingRef.current = isAiSpeaking || voiceLoading; }, [isAiSpeaking, voiceLoading]);
+  const sayWarning = async (type: string): Promise<void> => {
+    if (!liveRef.current.audio || !INTEGRITY_SPOKEN[type]) return;
+    if (isAiSpeakingRef.current) { pendingWarningRef.current = type; return; }   // don't cut the question off
+    const wasRecording = !!recognitionRef.current;
+    if (wasRecording) stopVoiceRecording();          // pause, so the warning isn't typed into the answer
+    isAiSpeakingRef.current = true;
+    try { await speakParts(BACKEND_URL, liveRef.current.token, [INTEGRITY_SPOKEN[type]]); }
+    finally { isAiSpeakingRef.current = false; }
+    if (wasRecording && interviewLiveRef.current) startRecRef.current(true);   // carry on where they left off
+  };
+
+  const logIntegrity = (type: string) => {
+    const ir = integrityRef.current;
+    const now = Date.now();
+    if (!interviewLiveRef.current || now - (ir.last[type] || 0) < 6000) return;
+    ir.last[type] = now;
+    ir.counts[type] = (ir.counts[type] || 0) + 1;
+    setIntegrityCounts({ ...ir.counts });
+    setIntegrityAlert(INTEGRITY_MESSAGES[type]);
+    setTimeout(() => setIntegrityAlert(a => (a === INTEGRITY_MESSAGES[type] ? null : a)), 5000);
+    sayWarning(type);
+    // Recorded on the server immediately (backend log + admin panel)
+    const { interviewId: iid, token: tok, question } = liveRef.current;
+    if (iid && tok) {
+      fetch(`${BACKEND_URL}/interviews/${iid}/integrity`, {
+        method: 'POST', headers: { Authorization: `Bearer ${tok}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type, question_number: question }),
+      }).catch(() => {});
+    }
+  };
+  const trackIntegrity = (m: FaceMetrics) => {
+    const ir = integrityRef.current;
+    const log = (type: string) => logIntegrity(type);
+    ir.streak.multi = (m.faceCount > 1 || m.personCount > 1) ? ir.streak.multi + 1 : 0;
+    ir.streak.phone = m.phoneDetected ? ir.streak.phone + 1 : 0;
+    if (ir.streak.phone === 4) log('phone_detected');
+    ir.streak.motion = m.backgroundMotion > 0.06 ? ir.streak.motion + 1 : 0;
+    ir.streak.none = !m.facePresent ? ir.streak.none + 1 : 0;
+    if (ir.streak.multi === 3) log('multiple_faces');         // ~0.5 s with a second face
+    if (ir.streak.motion === 4) log('background_motion');     // ~0.7 s of background movement
+    if (ir.streak.none === 15) log('face_missing');           // ~2.5 s without a face
+  };
+
+  // Stops everything the interview uses: voice, microphone and camera
+  const shutdownInterviewMedia = () => {
+    interviewLiveRef.current = false;
+    cameraWantedRef.current = false;
+    stopSpeaking();
+    setIsAiSpeaking(false);
+    setVoiceLoading(false);
+    try { stopVoiceRecording(); } catch (_) {}
+    if (webcamStreamRef.current) {
+      webcamStreamRef.current.getTracks().forEach(t => t.stop());
+      webcamStreamRef.current = null;
+    }
+    if (webcamRef.current) webcamRef.current.srcObject = null;
+    setWebcamEnabled(false);
+    setIntegrityAlert(null);
+    setFsBlocked(false);
+    if (typeof document !== 'undefined' && document.fullscreenElement) document.exitFullscreen().catch(() => {});
+  };
+
+  const endInterviewNow = () => {
+    shutdownInterviewMedia();
+    submitAnswerWithText('Thank you, I would like to conclude the interview.');
+  };
+
+  // Interview lock-down: full screen required; switching tabs/apps is detected and logged
+  useEffect(() => {
+    const onFs = () => {
+      if (!interviewLiveRef.current) { setFsBlocked(false); return; }
+      if (!document.fullscreenElement) { setFsBlocked(true); logIntegrity('fullscreen_exit'); }
+      else setFsBlocked(false);
+    };
+    const onHide = () => { if (document.hidden) logIntegrity('tab_switch'); };
+    const onBlur = () => { if (interviewLiveRef.current && !document.hidden) logIntegrity('tab_switch'); };
+    document.addEventListener('fullscreenchange', onFs);
+    document.addEventListener('visibilitychange', onHide);
+    window.addEventListener('blur', onBlur);
+    return () => {
+      document.removeEventListener('fullscreenchange', onFs);
+      document.removeEventListener('visibilitychange', onHide);
+      window.removeEventListener('blur', onBlur);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const enterFullscreen = () => { document.documentElement.requestFullscreen?.().catch(() => {}); };
+
+  // Leaving the interview tab (or the page) turns off voice, mic and camera immediately
+  useEffect(() => {
+    if (sidebarTab !== 'interview') shutdownInterviewMedia();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sidebarTab]);
+  useEffect(() => {
+    const off = () => shutdownInterviewMedia();
+    window.addEventListener('beforeunload', off);
+    return () => { window.removeEventListener('beforeunload', off); off(); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Averages the face metrics collected while the candidate answered the current question
   const collectFaceMetrics = () => {
@@ -773,6 +988,13 @@ export default function GapXApp() {
     } catch (_) {}
   };
 
+  const fetchDailyChallenge = async (tok: string) => {
+    try {
+      const r = await fetch(`${BACKEND_URL}/coding/daily`, { headers: { Authorization: `Bearer ${tok}` } });
+      if (r.ok) setDailyChallenge(await r.json());
+    } catch (_) {}
+  };
+
   const fetchReadiness = async (tok: string) => {
     try {
       const r = await fetch(`${BACKEND_URL}/users/readiness`, { headers: { Authorization: `Bearer ${tok}` } });
@@ -812,7 +1034,7 @@ export default function GapXApp() {
     setAppState(prof.education && prof.target_roles?.length ? 'dashboard' : 'onboarding');
     fetchProblems(tok);
     if (prof.education) {
-      fetchRoadmap(tok); fetchNotifications(tok); fetchResume(tok); fetchReadiness(tok); fetchInterview(tok);
+      fetchRoadmap(tok); fetchNotifications(tok); fetchResume(tok); fetchReadiness(tok); fetchInterview(tok); fetchDailyChallenge(tok);
     }
   };
 
@@ -820,10 +1042,46 @@ export default function GapXApp() {
   const handleAuth = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true); setErrorMessage('');
+    if (authMode === 'email') {
+      try {
+        let r: Response;
+        try {
+          r = await fetch(`${BACKEND_URL}/auth/check-email`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: email.trim() })
+          });
+        } catch (_) {
+          throw new Error("Can't reach the GapX server. Make sure the backend is running (run_app.bat), then try again.");
+        }
+        const d = await r.json();
+        if (!r.ok) throw new Error(typeof d.detail === 'string' ? d.detail : 'Please enter a valid email.');
+        setPassword(''); setConfirmPassword(''); setCodeSent(false); setVerificationCode(''); setCodeInfo('');
+        setAuthMode(d.exists ? 'login' : 'register');
+      } catch (err: any) {
+        setErrorMessage(err.message);
+      } finally { setLoading(false); }
+      return;
+    }
+    if (authMode === 'register') {
+      const problem = !NAME_RE.test(fullName.trim()) ? "Please enter your real name (letters, spaces, . ' - only)."
+        : passwordProblem(password, email, fullName)
+        || (password !== confirmPassword ? "The two passwords don't match." : null);
+      if (problem) { setErrorMessage(problem); setLoading(false); return; }
+      // Step 1 of sign-up: email a code to prove the address belongs to this person
+      if (authConfig.email_verification !== false && !codeSent) {
+        const ok = await sendVerificationCode();
+        setLoading(false);
+        if (ok) setCodeSent(true);
+        return;
+      }
+      if (authConfig.email_verification !== false && !/^\d{6}$/.test(verificationCode.trim())) {
+        setErrorMessage('Enter the 6-digit code we emailed you.');
+        setLoading(false);
+        return;
+      }
+    }
     try {
       const endpoint = authMode === 'login' ? 'login' : 'register';
-      const body = authMode === 'login' ? { email, password } : { email, password, full_name: fullName };
-      if (authMode === 'register' && password.length < 6) throw new Error('Use a password with at least 6 characters.');
+      const body = authMode === 'login' ? { email, password } : { email, password, full_name: fullName, verification_code: verificationCode.trim() };
       let r: Response;
       try {
         r = await fetch(`${BACKEND_URL}/auth/${endpoint}`, {
@@ -843,6 +1101,23 @@ export default function GapXApp() {
     } finally { setLoading(false); }
   };
 
+  const sendVerificationCode = async (): Promise<boolean> => {
+    setErrorMessage('');
+    try {
+      const r = await fetch(`${BACKEND_URL}/auth/send-code`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: email.trim() })
+      });
+      const d = await r.json();
+      if (!r.ok) { setErrorMessage(typeof d.detail === 'string' ? d.detail : 'Could not send the code.'); return false; }
+      setCodeInfo(d.message);
+      setResendIn(60);
+      return true;
+    } catch (_) {
+      setErrorMessage("Can't reach the GapX server. Make sure the backend is running.");
+      return false;
+    }
+  };
+
   const completeTokenLogin = async (accessToken: string) => {
     const prof = await fetchProfile(accessToken);
     if (!prof) throw new Error('Could not load your profile.');
@@ -852,7 +1127,7 @@ export default function GapXApp() {
   // Google Identity Services: the official button appears when GOOGLE_CLIENT_ID is set on the backend
   useEffect(() => {
     const clientId = authConfig.google_client_id;
-    if (!clientId || appState !== 'auth') return;
+    if (!clientId || appState !== 'auth' || authMode !== 'email') return;
     const init = () => {
       const g = (window as any).google;
       if (!g?.accounts?.id || !googleBtnRef.current) return;
@@ -879,20 +1154,51 @@ export default function GapXApp() {
     script.async = true;
     script.onload = init;
     document.head.appendChild(script);
-  }, [authConfig.google_client_id, appState, themeMode]);
+  }, [authConfig.google_client_id, appState, themeMode, authMode]);
 
-  const handleDemoLogin = async () => {
-    setLoading(true); setErrorMessage('');
-    try {
-      let r: Response;
-      try { r = await fetch(`${BACKEND_URL}/auth/demo`, { method: 'POST' }); }
-      catch (_) { throw new Error("Can't reach the GapX server."); }
-      const d = await r.json();
-      if (!r.ok) throw new Error(d.detail || 'Demo login is unavailable');
-      await completeTokenLogin(d.access_token);
-    } catch (err: any) {
-      setErrorMessage(err.message || 'Something went wrong.');
-    } finally { setLoading(false); }
+
+  const validateOnboardStep = (step: number): string[] => {
+    const d = onboardData;
+    const errs: string[] = [];
+    if (step === 1) {
+      if (d.role === 'Student') {
+        if (d.collegeName.trim().length < 3) errs.push('Enter your college or university name.');
+        else if (!/^[A-Za-z0-9 .,&'()\-]{3,100}$/.test(d.collegeName.trim())) errs.push('College name has unusual characters.');
+        const c = d.cgpa.trim();
+        if (c) {
+          const v = parseFloat(c.replace('%', ''));
+          if (isNaN(v) || !(c.endsWith('%') ? v >= 0 && v <= 100 : v >= 0 && v <= 10)) errs.push('CGPA must be between 0 and 10 (or a percentage like 85%).');
+        }
+      }
+      if (d.role === 'Working Professional') {
+        if (d.currentCompany.trim().length < 2) errs.push('Enter your current company.');
+        if (d.currentDesignation.trim().length < 2) errs.push('Enter your job title.');
+      }
+      if (d.role === 'Career Switcher' && d.currentRoleCompany.trim().length < 3) errs.push('Enter your current role and organisation.');
+    }
+    if (step === 2) {
+      if (d.skills.length === 0) errs.push('Add at least one skill.');
+      if (d.skills.length > 40) errs.push('Please list at most 40 skills.');
+      if (d.languages.length === 0) errs.push('Pick at least one programming language.');
+    }
+    if (step === 3) {
+      if (!d.targetRoles.length) errs.push('Choose a target job role.');
+      const t = d.expectedPlacement.trim();
+      if (!t) errs.push('Enter your target placement date (e.g. June 2026 or Within 3 Months).');
+      else if (!/(\d+\s*(month|week)s?)|([a-z]{3,9}\s+\d{4})|(\d{4}-\d{1,2}-\d{1,2})/i.test(t)) errs.push('Write the placement date like "June 2026" or "Within 3 Months".');
+    }
+    if (step === 4) {
+      const digits = d.phone.replace(/\D/g, '');
+      if (d.phone.trim() && (!/^\+?[\d\s\-()]{7,20}$/.test(d.phone.trim()) || digits.length < 10 || digits.length > 15)) errs.push('Enter a valid phone number (10–15 digits, optional + country code).');
+      if (d.location.trim() && !/^[A-Za-z .,'\-]{2,60}$/.test(d.location.trim())) errs.push('City should only contain letters, spaces and commas.');
+      if (d.linkedin.trim() && !LINKEDIN_RE.test(d.linkedin.trim())) errs.push('LinkedIn must look like https://linkedin.com/in/your-name');
+      if (d.github.trim() && !GITHUB_RE.test(d.github.trim())) errs.push('GitHub must look like https://github.com/username');
+      if (d.projectTitle.trim() && (d.projectTitle.trim().length < 3 || d.projectTitle.trim().length > 80)) errs.push('Project name should be 3–80 characters.');
+      if (d.projectDescription.trim() && !d.projectTitle.trim()) errs.push('Add a name for the project you described.');
+      if (d.projectDescription.length > 1200) errs.push('Project description should be under 1200 characters.');
+      if (d.interests.split(',').filter(x => x.trim()).length > 10) errs.push('List at most 10 interests.');
+    }
+    return errs;
   };
 
   const handleOnboard = async () => {
@@ -947,7 +1253,7 @@ export default function GapXApp() {
           // Role specific detailed metadata
           college_name: onboardData.collegeName,
           degree_branch: onboardData.degreeBranch,
-          cgpa: Number(onboardData.cgpa) || null,
+          cgpa: onboardData.cgpa || null,
           graduation_year: onboardData.gradYear,
           current_company: onboardData.currentCompany,
           current_designation: onboardData.currentDesignation,
@@ -956,7 +1262,17 @@ export default function GapXApp() {
           highest_degree: onboardData.highestDegree,
           current_domain: onboardData.currentDomain,
           transition_timeline: onboardData.transitionTimeline,
-          switch_goal: onboardData.switchGoal
+          switch_goal: onboardData.switchGoal,
+          semester_label: onboardData.studentSemester,
+          phone: onboardData.phone,
+          location: onboardData.location,
+          linkedin: onboardData.linkedin,
+          github: onboardData.github,
+          portfolio: onboardData.portfolio,
+          project_title: onboardData.projectTitle,
+          project_stack: onboardData.projectStack,
+          project_description: onboardData.projectDescription,
+          interests: onboardData.interests.split(',').map(x => x.trim()).filter(Boolean)
         })
       });
       if (!r.ok) {
@@ -973,7 +1289,7 @@ export default function GapXApp() {
         if (rd && Array.isArray(rd.stages_data)) setRoadmap(rd);
       }
       setAppState('dashboard');
-      fetchProblems(token!); fetchNotifications(token!);
+      fetchProblems(token!); fetchNotifications(token!); fetchDailyChallenge(token!); fetchReadiness(token!);
     } catch (err: any) { setErrorMessage(err.message || 'Onboarding failed. Please try again.'); }
     finally { setLoading(false); }
   };
@@ -1193,6 +1509,23 @@ export default function GapXApp() {
     return true;
   };
 
+  const runJdMatch = async () => {
+    if (!token) return;
+    setJdLoading(true);
+    try {
+      const r = await fetch(`${BACKEND_URL}/resumes/jd-match`, {
+        method: 'POST', headers: authHeaders(), body: JSON.stringify({ job_description: jdText, resume: buildResumePayload() })
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(typeof d.detail === 'string' ? d.detail : 'Could not compare with the job description.');
+      setJdResult(d);
+    } catch (err: any) {
+      alert(err.message?.includes('fetch') ? "Can't reach the GapX server." : err.message);
+    } finally {
+      setJdLoading(false);
+    }
+  };
+
   const generateResumeSummary = async () => {
     if (!token) return;
     setSummaryLoading(true);
@@ -1321,7 +1654,7 @@ export default function GapXApp() {
             if (draftR.ok) {
               const draftData = await draftR.json();
               const starterMap: any = { python: p.starter_code_python, c: p.starter_code_c, cpp: p.starter_code_cpp, java: p.starter_code_java, javascript: p.starter_code_js };
-              const chosenCode = draftData.code || starterMap[editorLang] || p.starter_code_python || '# Write solution here\n';
+              const chosenCode = draftData.code || starterMap[editorLang] || (editorLang === 'c' ? '// C isn\'t available for this problem yet (it uses grids, 2-D arrays or a class).\n// Please switch to C++, Java, Python or JavaScript.\n' : p.starter_code_python) || '# Write solution here\n';
               setEditorCode(chosenCode);
               lastSavedCodeRef.current = chosenCode;
             } else {
@@ -1332,7 +1665,7 @@ export default function GapXApp() {
           }
         } else {
           const starterMap: any = { python: p.starter_code_python, c: p.starter_code_c, cpp: p.starter_code_cpp, java: p.starter_code_java, javascript: p.starter_code_js };
-          const defaultCode = starterMap[editorLang] || p.starter_code_python || '# Write solution here\n';
+          const defaultCode = starterMap[editorLang] || (editorLang === 'c' ? '// C isn\'t available for this problem yet (it uses grids, 2-D arrays or a class).\n// Please switch to C++, Java, Python or JavaScript.\n' : p.starter_code_python) || '# Write solution here\n';
           setEditorCode(defaultCode);
           lastSavedCodeRef.current = defaultCode;
         }
@@ -1360,17 +1693,17 @@ export default function GapXApp() {
         if (draftR.ok) {
           const draftData = await draftR.json();
           const starterMap: any = { python: activeProblem.starter_code_python, c: activeProblem.starter_code_c, cpp: activeProblem.starter_code_cpp, java: activeProblem.starter_code_java, javascript: activeProblem.starter_code_js };
-          const chosen = draftData.code || starterMap[lang] || '// Write solution here\n';
+          const chosen = draftData.code || starterMap[lang] || (lang === 'c' ? '// C isn\'t available for this problem yet (it uses grids, 2-D arrays or a class).\n// Please switch to C++, Java, Python or JavaScript.\n' : '// Write solution here\n');
           setEditorCode(chosen);
           lastSavedCodeRef.current = chosen;
           return;
         }
       } catch (_) {}
       const starterMap: any = { python: activeProblem.starter_code_python, c: activeProblem.starter_code_c, cpp: activeProblem.starter_code_cpp, java: activeProblem.starter_code_java, javascript: activeProblem.starter_code_js };
-      setEditorCode(starterMap[lang] || '// Write solution here\n');
+      setEditorCode(starterMap[lang] || (lang === 'c' ? '// C isn\'t available for this problem yet (it uses grids, 2-D arrays or a class).\n// Please switch to C++, Java, Python or JavaScript.\n' : '// Write solution here\n'));
     } else {
       const starterMap: any = { python: activeProblem.starter_code_python, c: activeProblem.starter_code_c, cpp: activeProblem.starter_code_cpp, java: activeProblem.starter_code_java, javascript: activeProblem.starter_code_js };
-      setEditorCode(starterMap[lang] || '// Write solution here\n');
+      setEditorCode(starterMap[lang] || (lang === 'c' ? '// C isn\'t available for this problem yet (it uses grids, 2-D arrays or a class).\n// Please switch to C++, Java, Python or JavaScript.\n' : '// Write solution here\n'));
     }
   };
 
@@ -1432,7 +1765,7 @@ export default function GapXApp() {
           setActiveOutputTab('testcases');
         }
         if (token) {
-          fetchProblems(token); fetchProfile(token); fetchReadiness(token); fetchNotifications(token);
+          fetchProblems(token); fetchProfile(token); fetchReadiness(token); fetchNotifications(token); fetchDailyChallenge(token);
         }
       } else {
         const d = await r.json().catch(() => ({}));
@@ -1524,7 +1857,7 @@ export default function GapXApp() {
   const audioStreamRef = useRef<MediaStream | null>(null);
   const animFrameRef = useRef<number | null>(null);
 
-  const startVoiceRecording = async () => {
+  const startVoiceRecording = async (resume = false) => {
     if (typeof window === 'undefined') return;
     const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (!SpeechRecognition) {
@@ -1568,6 +1901,19 @@ export default function GapXApp() {
       recognition.continuous = true;
       recognition.interimResults = true;
       recognition.lang = 'en-US';
+      wantListenRef.current = true;
+      // Whatever is already in the answer box stays; new speech is added after it
+      let base = candidateTextRef.current.trim();
+      const scheduleSubmit = (full: string) => {
+        if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+        setSilenceCountdown(4);
+        silenceTimerRef.current = setTimeout(() => {
+          stopVoiceRecording();
+          submitAnswerWithText(full);
+        }, 4500);
+      };
+      // Resuming after a warning with an answer already given: still submit after the usual pause
+      if (resume && base) scheduleSubmit(base);
 
       const startTime = Date.now();
       speakingStartTimeRef.current = startTime;
@@ -1584,7 +1930,9 @@ export default function GapXApp() {
         }
 
         if (transcript.trim()) {
-          setCandidateResponse(transcript);
+          const full = (base ? base + ' ' : '') + transcript.trim();
+          setCandidateResponse(full);
+          candidateTextRef.current = full;
 
           // Calculate Speaking Pace (Words Per Minute)
           const words = transcript.trim().split(/\s+/);
@@ -1598,18 +1946,22 @@ export default function GapXApp() {
           setFillerWordsCount(fillerMatches ? fillerMatches.length : 0);
 
           // Auto-submit countdown after 4 seconds of speech silence
-          if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-          setSilenceCountdown(4);
-          
-          silenceTimerRef.current = setTimeout(() => {
-            stopVoiceRecording();
-            submitAnswerWithText(transcript);
-          }, 4500);
+          scheduleSubmit(full);
         }
       };
 
-      recognition.onerror = () => { stopVoiceRecording(); };
-      recognition.onend = () => { setIsRecording(false); };
+      recognition.onerror = (e: any) => {
+        // Silence or a network blip: onend restarts listening. Anything else (mic blocked): stop.
+        if (!['no-speech', 'aborted', 'network'].includes(e?.error)) stopVoiceRecording();
+      };
+      recognition.onend = () => {
+        // Chrome stops listening after a few seconds of silence; keep the mic open until the answer is in
+        if (wantListenRef.current && recognitionRef.current === recognition && interviewLiveRef.current && !isAiSpeakingRef.current) {
+          base = candidateTextRef.current.trim();
+          try { recognition.start(); return; } catch (_) {}
+        }
+        setIsRecording(false);
+      };
 
       recognition.start();
       recognitionRef.current = recognition;
@@ -1619,6 +1971,7 @@ export default function GapXApp() {
   };
 
   const stopVoiceRecording = () => {
+    wantListenRef.current = false;
     if (silenceTimerRef.current) {
       clearTimeout(silenceTimerRef.current);
       silenceTimerRef.current = null;
@@ -1647,6 +2000,8 @@ export default function GapXApp() {
     setIsRecording(false);
   };
 
+  startRecRef.current = (resume?: boolean) => { startVoiceRecording(resume); };
+
   // --- INTERVIEW ROOM EXECUTION ---
   const applyInterviewTurn = (d: any) => {
     if (d.phase) setInterviewPhase(d.phase);
@@ -1663,6 +2018,7 @@ export default function GapXApp() {
 
   const startInterview = async () => {
     if (!token) return;
+    enterFullscreen();
     setLoading(true);
     setErrorMessage('');
     setInterviewFeedback(null);
@@ -1672,6 +2028,10 @@ export default function GapXApp() {
     setLiveInterviewScore(0);
     setLiveConfidenceMetric(0);
     faceSamplesRef.current = [];
+    integrityRef.current = { pending: [], counts: { multiple_faces: 0, background_motion: 0, face_missing: 0, phone_detected: 0, tab_switch: 0, fullscreen_exit: 0, paste_attempt: 0 }, last: {}, streak: { multi: 0, motion: 0, none: 0, phone: 0 } };
+    setIntegrityCounts({ multiple_faces: 0, background_motion: 0, face_missing: 0, phone_detected: 0, tab_switch: 0, fullscreen_exit: 0, paste_attempt: 0 });
+    setIntegrityAlert(null);
+    interviewLiveRef.current = true;
 
     const track = INTERVIEW_TRACKS.find(t => t.id === topicDomain);
     const role = targetInterviewRole || track?.label || userProfile?.target_roles?.[0] || 'Software Engineer';
@@ -1697,7 +2057,7 @@ export default function GapXApp() {
       applyInterviewTurn({ ...d, question_number: 1, question_kind: 'intro' });
       setInterviewMessages([{ role: 'interviewer', text: d.first_question, is_first: true }]);
       setInterviewStarted(true);
-      speakInterviewerText(d.first_question);
+      speakInterviewerText(d.first_question, d.speech_parts, true);
     } catch (err: any) {
       const msg = err.message?.includes('fetch') ? "Can't reach the GapX server. Start the backend and try again." : err.message;
       setErrorMessage(msg);
@@ -1741,8 +2101,9 @@ export default function GapXApp() {
       if (correction) setCurrentTurnCorrection(correction);
 
       if (d.is_finished) {
+        // The interview is over: no more voice, and the camera and mic are released right away
+        shutdownInterviewMedia();
         setInterviewMessages([...updatedMsgs, { role: 'interviewer', text: d.speech_text_to_speak, ...(correction || {}) }]);
-        speakInterviewerText(d.speech_text_to_speak);
         const fbRes = await fetch(`${BACKEND_URL}/interviews/${interviewId}/feedback`, { headers: authHeaders() });
         if (fbRes.ok) setInterviewFeedback(await fbRes.json());
         setInterviewStarted(false);
@@ -1752,7 +2113,7 @@ export default function GapXApp() {
           ...updatedMsgs,
           { role: 'interviewer', text: d.next_question, spoken: d.speech_text_to_speak, kind: d.question_kind, ...(correction || {}) },
         ]);
-        speakInterviewerText(d.speech_text_to_speak || d.next_question);
+        speakInterviewerText(d.speech_text_to_speak || d.next_question, d.speech_parts, true);
       }
     } catch (err: any) {
       setInterviewMessages(interviewMessages);
@@ -1769,9 +2130,11 @@ export default function GapXApp() {
   const toggleWebcam = async () => {
     if (!webcamEnabled) {
       try {
+        cameraWantedRef.current = true;
         const stream = await navigator.mediaDevices.getUserMedia({
           video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' }
         });
+        if (!cameraWantedRef.current) { stream.getTracks().forEach(t => t.stop()); return; }
         webcamStreamRef.current = stream;
         setWebcamEnabled(true);
         if (webcamRef.current) {
@@ -1782,6 +2145,7 @@ export default function GapXApp() {
         console.error('Camera access error:', err);
       }
     } else {
+      cameraWantedRef.current = false;
       if (webcamStreamRef.current) {
         webcamStreamRef.current.getTracks().forEach(t => t.stop());
         webcamStreamRef.current = null;
@@ -2153,10 +2517,84 @@ public:
   }
 
   // --- MENTOR ---
+  // --- AI COACH VOICE: speak your question, hear the answer in the app's voice ---
+  const [coachVoiceReplies, setCoachVoiceReplies] = useState(false);  // answers stay silent unless asked
+  const [coachListening, setCoachListening] = useState(false);
+  const [coachSpeakingIdx, setCoachSpeakingIdx] = useState<number | null>(null);
+  const coachRecRef = useRef<any>(null);
+  const coachSilenceRef = useRef<any>(null);
+
+  const speakCoachAnswer = (text: string, idx: number) => {
+    if (!text) return;
+    setCoachSpeakingIdx(idx);
+    speakParts(BACKEND_URL, token, [text]).finally(() => setCoachSpeakingIdx(i => (i === idx ? null : i)));
+  };
+
+  const stopCoachListening = () => {
+    if (coachSilenceRef.current) clearTimeout(coachSilenceRef.current);
+    try { coachRecRef.current?.stop(); } catch (_) {}
+    coachRecRef.current = null;
+    setCoachListening(false);
+  };
+
+  const startCoachListening = () => {
+    const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SR) { alert('Voice input works in Chrome and Edge. Please switch browsers or type your question.'); return; }
+    stopSpeaking();
+    setCoachSpeakingIdx(null);
+    const rec = new SR();
+    rec.lang = 'en-IN';
+    rec.continuous = true;
+    rec.interimResults = true;
+    let finalText = '';
+    rec.onresult = (event: any) => {
+      let interim = '';
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const t = event.results[i][0].transcript;
+        if (event.results[i].isFinal) finalText += t + ' '; else interim += t;
+      }
+      setMentorQuery((finalText + interim).trim());
+      if (coachSilenceRef.current) clearTimeout(coachSilenceRef.current);
+      // Send automatically after ~2 seconds of silence
+      coachSilenceRef.current = setTimeout(() => {
+        const q = (finalText + interim).trim();
+        stopCoachListening();
+        if (q) sendMentor(q);
+      }, 2000);
+    };
+    rec.onerror = () => stopCoachListening();
+    rec.onend = () => setCoachListening(false);
+    coachRecRef.current = rec;
+    rec.start();
+    setCoachListening(true);
+  };
+
+  // Leaving the coach stops its voice and microphone
+  useEffect(() => {
+    if (sidebarTab !== 'mentor') {
+      stopCoachListening();
+      if (coachSpeakingIdx !== null) { stopSpeaking(); setCoachSpeakingIdx(null); }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sidebarTab]);
+
+  const AUDIO_REQUEST_RE = /\b(read (it|that|this|the answer)( out| aloud| out loud)?|say (it|that) (aloud|out loud)|speak (it|that|the answer)|out loud|aloud|in (a )?voice|voice (answer|reply)|audio)\b/i;
   const sendMentor = async (queryText?: string) => {
     const q = (queryText || mentorQuery).trim();
     if (!q || mentorLoading) return;
+    const wantsAudio = AUDIO_REQUEST_RE.test(q);
+    // "Read that aloud" on its own replays the previous answer instead of asking a new question
+    if (wantsAudio && q.split(/\s+/).length <= 7) {
+      const lastIdx = [...mentorMessages].map((m, i) => ({ m, i })).reverse().find(x => x.m.role === 'assistant' && x.m.spoken)?.i;
+      if (lastIdx !== undefined) {
+        setMentorQuery('');
+        speakCoachAnswer(mentorMessages[lastIdx].spoken!, lastIdx);
+        return;
+      }
+    }
     const updated = [...mentorMessages, { role: 'user', text: q }];
+    stopSpeaking();
+    setCoachSpeakingIdx(null);
     setMentorMessages(updated);
     setMentorQuery('');
     setMentorLoading(true);
@@ -2165,7 +2603,7 @@ public:
       if (token) headers['Authorization'] = `Bearer ${token}`;
 
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 6000);
+      const timeoutId = setTimeout(() => controller.abort(), 90000);
 
       const r = await fetch(`${BACKEND_URL}/mentor/chat`, {
         method: 'POST',
@@ -2178,7 +2616,9 @@ public:
       if (r.ok) {
         const d = await r.json();
         if (d && d.response) {
-          setMentorMessages([...updated, { role: 'assistant', text: d.response }]);
+          const next = [...updated, { role: 'assistant', text: d.response, spoken: d.spoken || '' }];
+          setMentorMessages(next);
+          if ((coachVoiceReplies || wantsAudio) && d.spoken) speakCoachAnswer(d.spoken, next.length - 1);
           if (Array.isArray(d.suggestions) && d.suggestions.length > 0) {
             setMentorSuggestions(d.suggestions);
           }
@@ -2203,22 +2643,6 @@ public:
   };
 
   // --- ADMIN ---
-  const createProblem = async (e: React.FormEvent) => {
-    e.preventDefault(); if (!token) return;
-    setLoading(true);
-    try {
-      const r = await fetch(`${BACKEND_URL}/admin/problems`, {
-        method: 'POST', headers: authHeaders(),
-        body: JSON.stringify({
-          ...newProblem,
-          expected_time_complexity: 'O(N)', expected_space_complexity: 'O(1)',
-          test_cases: [{ input: newProblem.example_input, output: newProblem.example_output, is_hidden: false }]
-        })
-      });
-      if (r.ok) { alert('Problem added!'); fetchProblems(token); }
-      else { const d = await r.json(); alert(d.detail); }
-    } catch (_) {} finally { setLoading(false); }
-  };
 
   const readiness = () => {
     if (readinessData?.placement_readiness_score) return readinessData.placement_readiness_score;
@@ -2241,9 +2665,10 @@ public:
   };
 
   const logout = () => {
+    shutdownInterviewMedia();
     localStorage.removeItem('gapx_session');
     setAppState('auth');
-    setAuthMode('login');
+    setAuthMode('email');
     setToken(null);
     setUserProfile(null);
     setEmail('');
@@ -2312,15 +2737,40 @@ public:
       >
       {/* ── AUTH ── */}
       {appState === 'auth' && (
-        <div className="flex-1 flex items-center justify-center p-6 bg-zinc-950 min-h-screen">
+        <div className="flex-1 min-h-screen lg:h-screen lg:overflow-hidden bg-zinc-950 grid lg:grid-cols-[1.15fr_1fr]">
+          <AuthShowcase />
+
+          {/* Form panel */}
+          <div className="relative flex flex-col items-center justify-center p-6 border-l border-zinc-800/60 lg:h-screen lg:overflow-y-auto">
           <motion.div
-            className="w-full max-w-md bg-zinc-900 border border-zinc-800 rounded-2xl p-8 shadow-2xl"
+            className="w-full max-w-[400px]"
             initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}
           >
-            <div className="text-center mb-6">
-              <GapXLogo size={56} className="mx-auto mb-3 drop-shadow-lg" />
-              <h2 className="text-2xl font-bold">Welcome to GapX AI</h2>
-              <p className="text-zinc-400 text-sm mt-1">Your AI-Powered Placement Coach</p>
+            <div className="mb-7">
+              <GapXLogo size={44} className="mb-4 lg:hidden" />
+              <h2 className="text-[28px] font-black tracking-tight text-white">
+                {authMode === 'email' ? 'Sign in or sign up' : authMode === 'login' ? 'Welcome back' : 'Create your account'}
+              </h2>
+              <p className="text-zinc-400 text-sm mt-1.5">
+                {authMode === 'email' ? "Enter your email. We'll sign you in, or set up a new account." : authMode === 'login' ? 'Enter your password to pick up where you left off.' : 'Free forever. Takes less than a minute.'}
+              </p>
+            </div>
+            {/* progress steps */}
+            <div className="flex items-center gap-2 mb-6 text-[11px] font-semibold">
+              {(authMode === 'register' ? ['Email', 'Details', 'Verify'] : ['Email', 'Password']).map((label, i) => {
+                const step = authMode === 'email' ? 0 : authMode === 'login' ? 1 : codeSent ? 2 : 1;
+                const on = i <= step;
+                return (
+                  <React.Fragment key={label}>
+                    {i > 0 && <div className={`flex-1 h-px ${on ? 'bg-indigo-500' : 'bg-zinc-800'}`} />}
+                    <span className={`flex items-center gap-1.5 ${on ? 'text-indigo-300' : 'text-zinc-600'}`}>
+                      <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] ${i < step ? 'bg-indigo-500 text-white' : on ? 'border border-indigo-400 text-indigo-300' : 'border border-zinc-700'}`}>
+                        {i < step ? '✓' : i + 1}
+                      </span>{label}
+                    </span>
+                  </React.Fragment>
+                );
+              })}
             </div>
 
             {errorMessage && (
@@ -2330,72 +2780,161 @@ public:
               </div>
             )}
 
-            <form onSubmit={handleAuth} className="space-y-4">
-              {authMode === 'register' && (
-                <div className="relative">
-                  <User className="absolute left-3 top-3 w-4 h-4 text-zinc-500" />
-                  <input type="text" placeholder="Full Name" required value={fullName} onChange={e => setFullName(e.target.value)}
-                    className="w-full pl-10 pr-4 py-2.5 bg-zinc-800 border border-zinc-700 rounded-xl text-sm focus:outline-none focus:border-indigo-500 text-white" />
+            {authConfig.google_client_id && authMode === 'email' && (
+              <>
+                <div ref={googleBtnRef} className="flex justify-center min-h-[44px]" />
+                <div className="relative my-5">
+                  <div className="absolute inset-0 flex items-center"><div className="w-full border-t border-zinc-800" /></div>
+                  <div className="relative flex justify-center"><span className="bg-zinc-950 px-3 text-[11px] uppercase tracking-wider text-zinc-500">or continue with email</span></div>
                 </div>
+              </>
+            )}
+
+            <form onSubmit={handleAuth} className="space-y-4">
+              <div className="relative">
+                <Mail className="absolute left-3 top-3.5 w-4 h-4 text-zinc-500" />
+                <input type="email" placeholder="Email address" required autoFocus value={email} disabled={authMode !== 'email'}
+                  onChange={e => setEmail(e.target.value)}
+                  className="w-full pl-10 pr-4 py-3 bg-zinc-900 border border-zinc-800 rounded-xl text-sm focus:outline-none focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/10 transition text-white placeholder:text-zinc-500 disabled:opacity-70" />
+              </div>
+
+              {authMode !== 'email' && (
+                <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} className="space-y-4">
+                  <div className={`text-xs rounded-xl p-2.5 border ${authMode === 'login' ? 'bg-indigo-500/10 border-indigo-500/25 text-indigo-300' : 'bg-emerald-500/10 border-emerald-500/25 text-emerald-300'}`}>
+                    {authMode === 'login' ? 'Welcome back! Enter your password to sign in.' : "You're new here. Create your account in a few seconds."}
+                  </div>
+                  {authMode === 'register' && (
+                    <div className="relative">
+                      <User className="absolute left-3 top-3.5 w-4 h-4 text-zinc-500" />
+                      <input type="text" placeholder="Full name" required autoFocus value={fullName} onChange={e => setFullName(e.target.value)}
+                        className="w-full pl-10 pr-4 py-3 bg-zinc-900 border border-zinc-800 rounded-xl text-sm focus:outline-none focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/10 transition text-white placeholder:text-zinc-500" />
+                    </div>
+                  )}
+                  <div className="relative">
+                    <Lock className="absolute left-3 top-3.5 w-4 h-4 text-zinc-500" />
+                    <input type="password" placeholder={authMode === 'register' ? 'Create a strong password' : 'Password'} required
+                      autoFocus={authMode === 'login'} value={password} onChange={e => setPassword(e.target.value)}
+                      className="w-full pl-10 pr-4 py-3 bg-zinc-900 border border-zinc-800 rounded-xl text-sm focus:outline-none focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/10 transition text-white placeholder:text-zinc-500" />
+                  </div>
+                  {authMode === 'register' && (() => {
+                    const st = passwordStrength(password);
+                    return (
+                      <div className="space-y-2 -mt-1">
+                        <div className="flex items-center gap-2">
+                          <div className="flex-1 grid grid-cols-4 gap-1">
+                            {[1, 2, 3, 4].map(i => <div key={i} className={`h-1.5 rounded-full transition-colors ${i <= st.score ? st.color : 'bg-zinc-800'}`} />)}
+                          </div>
+                          <span className="text-[10px] font-bold text-zinc-400 w-16 text-right">{st.label}</span>
+                        </div>
+                        <ul className="grid grid-cols-2 gap-x-3 gap-y-1">
+                          {PASSWORD_RULES.map(r => {
+                            const ok = r.test(password);
+                            return (
+                              <li key={r.label} className={`text-[10px] flex items-center gap-1 ${ok ? 'text-emerald-400' : 'text-zinc-500'}`}>
+                                {ok ? <CheckCircle2 className="w-3 h-3" /> : <span className="w-3 h-3 rounded-full border border-zinc-600 inline-block" />} {r.label}
+                              </li>
+                            );
+                          })}
+                        </ul>
+                      </div>
+                    );
+                  })()}
+                  {authMode === 'register' && (
+                    <div className="relative">
+                      <Lock className="absolute left-3 top-3.5 w-4 h-4 text-zinc-500" />
+                      <input type="password" placeholder="Confirm password" required value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)}
+                        className="w-full pl-10 pr-4 py-3 bg-zinc-900 border border-zinc-800 rounded-xl text-sm focus:outline-none focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/10 transition text-white placeholder:text-zinc-500" />
+                    </div>
+                  )}
+                  {authMode === 'register' && codeSent && (
+                    <motion.div initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} className="space-y-2 p-3 rounded-xl border border-indigo-500/30 bg-indigo-500/5">
+                      <div className="text-xs text-indigo-300 flex items-start gap-1.5"><Mail className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" /> {codeInfo}</div>
+                      <input inputMode="numeric" autoComplete="one-time-code" maxLength={6} placeholder="6-digit code" autoFocus
+                        value={verificationCode} onChange={e => setVerificationCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                        className="w-full text-center tracking-[0.5em] font-mono text-lg py-2.5 bg-zinc-800 border border-zinc-700 rounded-xl focus:outline-none focus:border-indigo-500 text-white" />
+                      <div className="flex justify-between text-[11px]">
+                        <span className="text-zinc-500">The code expires in 10 minutes.</span>
+                        <button type="button" disabled={resendIn > 0 || loading} onClick={() => sendVerificationCode()}
+                          className="text-indigo-400 hover:underline disabled:text-zinc-600 disabled:no-underline font-semibold">
+                          {resendIn > 0 ? `Resend in ${resendIn}s` : 'Resend code'}
+                        </button>
+                      </div>
+                    </motion.div>
+                  )}
+                </motion.div>
               )}
-              <div className="relative">
-                <Mail className="absolute left-3 top-3 w-4 h-4 text-zinc-500" />
-                <input type="text" placeholder="Email Address" required value={email} onChange={e => setEmail(e.target.value)}
-                  className="w-full pl-10 pr-4 py-2.5 bg-zinc-800 border border-zinc-700 rounded-xl text-sm focus:outline-none focus:border-indigo-500 text-white" />
-              </div>
-              <div className="relative">
-                <Lock className="absolute left-3 top-3 w-4 h-4 text-zinc-500" />
-                <input type="password" placeholder="Password" required value={password} onChange={e => setPassword(e.target.value)}
-                  className="w-full pl-10 pr-4 py-2.5 bg-zinc-800 border border-zinc-700 rounded-xl text-sm focus:outline-none focus:border-indigo-500 text-white" />
-              </div>
+
               <button type="submit" disabled={loading}
-                className="w-full py-2.5 bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white font-semibold rounded-xl transition-all shadow-lg shadow-indigo-500/20 text-sm">
-                {loading ? 'Please wait...' : (authMode === 'login' ? 'Sign In' : 'Create Account')}
+                className="w-full py-3 bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 active:scale-[0.99] disabled:opacity-60 text-white font-bold rounded-xl transition-all shadow-lg shadow-indigo-500/25 text-sm">
+                {loading ? 'Please wait...' : authMode === 'email' ? 'Continue' : authMode === 'login' ? 'Sign In'
+                  : (authConfig.email_verification !== false && !codeSent) ? 'Send verification code' : 'Verify & create account'}
               </button>
             </form>
 
-            {(authConfig.google_client_id || authConfig.demo_login_enabled) && (
-              <div className="relative my-5">
-                <div className="absolute inset-0 flex items-center"><div className="w-full border-t border-zinc-800" /></div>
-                <div className="relative flex justify-center"><span className="bg-zinc-900 px-3 text-xs text-zinc-500">or</span></div>
-              </div>
+            {authMode !== 'email' && (
+              <p className="text-center text-xs text-zinc-500 mt-4">
+                Not {email}?{' '}
+                <button type="button" onClick={() => { setAuthMode('email'); setPassword(''); setConfirmPassword(''); setErrorMessage(''); setCodeSent(false); setVerificationCode(''); setCodeInfo(''); }}
+                  className="text-indigo-400 hover:underline font-semibold">Use a different email</button>
+              </p>
             )}
 
-            {/* Official Google button (rendered by Google Identity Services when configured) */}
-            {authConfig.google_client_id && <div ref={googleBtnRef} className="flex justify-center min-h-[44px]" />}
-
-            {authConfig.demo_login_enabled && (
-              <button onClick={handleDemoLogin} disabled={loading} type="button"
-                className="w-full mt-3 py-2.5 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-sm font-medium rounded-xl flex items-center justify-center gap-2 transition-colors">
-                <Sparkles className="w-4 h-4 text-indigo-400" />
-                Try the demo account
-              </button>
-            )}
-
-            <p className="text-center text-xs text-zinc-500 mt-5">
-              {authMode === 'login' ? "Don't have an account? " : 'Already registered? '}
-              <button onClick={() => { setAuthMode(authMode === 'login' ? 'register' : 'login'); setErrorMessage(''); }}
-                className="text-indigo-400 hover:underline font-semibold">
-                {authMode === 'login' ? 'Create one' : 'Sign in'}
-              </button>
-            </p>
+            <div className="mt-8 pt-5 border-t border-zinc-800/70 grid grid-cols-3 gap-3 text-center">
+              {[['Strict', 'password rules'], ['Verified', 'email domains'], ['Private', 'your data stays yours']].map(([a, b]) => (
+                <div key={a}><div className="text-xs font-bold text-zinc-200">{a}</div><div className="text-[10px] text-zinc-500">{b}</div></div>
+              ))}
+            </div>
+            <p className="mt-5 text-center text-[11px] text-zinc-600">By continuing you agree to use GapX for honest practice.</p>
           </motion.div>
+          </div>
         </div>
       )}
 
       {/* ── ONBOARDING ── */}
       {appState === 'onboarding' && (
-        <div className="flex-1 flex items-center justify-center p-6 min-h-screen bg-zinc-950">
-          <div className="w-full max-w-2xl bg-zinc-900 border border-zinc-800 rounded-2xl p-8">
-            {/* Steps bar */}
-            <div className="flex items-center mb-8">
-              {[1, 2, 3].map((s, i) => (
-                <React.Fragment key={s}>
-                  <div className={`w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0 transition-all ${onboardStep >= s ? 'bg-indigo-600 text-white' : 'bg-zinc-800 text-zinc-500'}`}>{s}</div>
-                  {i < 2 && <div className={`flex-1 h-1 mx-2 rounded-full transition-colors ${onboardStep > s ? 'bg-indigo-600' : 'bg-zinc-800'}`} />}
-                </React.Fragment>
-              ))}
-            </div>
+        <div className="flex-1 flex items-center justify-center p-4 sm:p-6 min-h-screen bg-zinc-950">
+          <div className="w-full max-w-5xl bg-zinc-900 border border-zinc-800 rounded-3xl overflow-hidden shadow-2xl grid md:grid-cols-[260px_1fr]">
+            {/* Step rail */}
+            <aside className="relative bg-gradient-to-b from-indigo-700 via-violet-700 to-fuchsia-800 p-6 flex flex-col gap-6" style={{ color: '#ffffff' }}>
+              <div className="flex items-center gap-2.5">
+                <GapXLogo size={34} />
+                <div>
+                  <div className="text-sm font-black">GapX AI</div>
+                  <div className="text-[10px] uppercase tracking-widest opacity-80">Set up your profile</div>
+                </div>
+              </div>
+              <ol className="space-y-1">
+                {[
+                  { n: 1, title: 'About you', sub: 'Background & education' },
+                  { n: 2, title: 'Your skills', sub: 'Tech you know' },
+                  { n: 3, title: 'Your goal', sub: 'Target role & timeline' },
+                  { n: 4, title: 'Your profile', sub: 'Links & a project' },
+                ].map(st => (
+                  <li key={st.n} className={`flex items-center gap-3 rounded-2xl p-2.5 transition-colors ${onboardStep === st.n ? 'bg-white/15' : ''}`}>
+                    <div className={`w-8 h-8 rounded-full flex items-center justify-center text-xs font-black flex-shrink-0 border ${onboardStep > st.n ? 'bg-white border-white' : onboardStep === st.n ? 'bg-white/25 border-white' : 'border-white/40'}`}
+                      style={{ color: onboardStep > st.n ? '#4f46e5' : '#ffffff' }}>
+                      {onboardStep > st.n ? <Check className="w-4 h-4" /> : st.n}
+                    </div>
+                    <div>
+                      <div className="text-sm font-bold">{st.title}</div>
+                      <div className="text-[11px] opacity-75">{st.sub}</div>
+                    </div>
+                  </li>
+                ))}
+              </ol>
+              <div className="mt-auto">
+                <div className="flex justify-between text-[11px] opacity-80 mb-1"><span>Progress</span><span>{Math.round(((onboardStep - 1) / 4) * 100)}%</span></div>
+                <div className="h-1.5 rounded-full bg-white/20 overflow-hidden">
+                  <motion.div className="h-full bg-white" animate={{ width: `${((onboardStep - 1) / 4) * 100}%` }} />
+                </div>
+                <p className="text-[11px] opacity-75 mt-3">Everything you enter fills your resume, roadmap and mock interviews automatically.</p>
+              </div>
+            </aside>
+
+            {/* Form */}
+            <div className="p-6 sm:p-8 max-h-[92vh] overflow-y-auto">
+            <AnimatePresence mode="wait">
+            <motion.div key={onboardStep} initial={{ opacity: 0, x: 24 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -24 }} transition={{ duration: 0.25 }}>
 
             {/* ── STEP 1: DYNAMIC ROLE-BASED PROFILE ── */}
             {onboardStep === 1 && (
@@ -2765,7 +3304,10 @@ public:
                         { id: 'DevOps & Cloud Engineer', title: 'DevOps & Cloud Engineer', sub: 'Docker, K8s & CI/CD' },
                         { id: 'Data Scientist', title: 'Data Scientist', sub: 'Analytics, ML & SQL' },
                         { id: 'Android Developer', title: 'Android Developer', sub: 'Kotlin, Compose & Android SDK' },
-                        { id: 'Cloud Architect', title: 'Cloud Architect', sub: 'AWS, GCP & High Availability' }
+                        { id: 'Cloud Architect', title: 'Cloud Architect', sub: 'AWS, GCP & High Availability' },
+                        { id: 'Data Analyst', title: 'Data Analyst', sub: 'SQL, Excel, Power BI' },
+                        { id: 'Cybersecurity Engineer', title: 'Cybersecurity Engineer', sub: 'OWASP, networks, SOC' },
+                        { id: 'iOS / Flutter Developer', title: 'iOS / Flutter Developer', sub: 'Swift, Flutter & mobile UX' }
                       ].map(r => (
                         <button
                           key={r.id}
@@ -2815,21 +3357,74 @@ public:
               </div>
             )}
 
-            {errorMessage && <p className="text-red-400 text-xs mt-3">{errorMessage}</p>}
+            {onboardStep === 4 && (
+              <div>
+                <h3 className="text-xl font-bold mb-1 text-white">Your profile</h3>
+                <p className="text-zinc-400 text-xs mb-5">These details fill your resume automatically and help the AI interviewer ask about your own work. Everything here is optional and editable later.</p>
+                <div className="space-y-4">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    {([
+                      ['phone', 'Phone number', '+91 98765 43210', 'tel'],
+                      ['location', 'City', 'Bengaluru, India', 'text'],
+                      ['linkedin', 'LinkedIn URL', 'https://linkedin.com/in/username', 'url'],
+                      ['github', 'GitHub URL', 'https://github.com/username', 'url'],
+                    ] as [keyof typeof onboardData, string, string, string][]).map(([key, label, ph, type]) => (
+                      <div key={key}>
+                        <label className="text-xs text-zinc-400 mb-1 block font-medium">{label}</label>
+                        <input type={type} placeholder={ph} value={onboardData[key] as string}
+                          onChange={e => setOnboardData({ ...onboardData, [key]: e.target.value })}
+                          className="w-full bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-indigo-500" />
+                      </div>
+                    ))}
+                  </div>
+                  <div className="p-4 rounded-xl border border-zinc-800 bg-zinc-950/60 space-y-3">
+                    <div className="text-xs font-bold text-white">A project you're proud of</div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <input placeholder="Project name, e.g. Campus Food Ordering App" value={onboardData.projectTitle}
+                        onChange={e => setOnboardData({ ...onboardData, projectTitle: e.target.value })}
+                        className="w-full bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-indigo-500" />
+                      <input placeholder="Tech used, e.g. React, FastAPI, PostgreSQL" value={onboardData.projectStack}
+                        onChange={e => setOnboardData({ ...onboardData, projectStack: e.target.value })}
+                        className="w-full bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-indigo-500" />
+                    </div>
+                    <textarea rows={3} placeholder="What does it do, what did you build, and what was the result? (one point per line)" value={onboardData.projectDescription}
+                      onChange={e => setOnboardData({ ...onboardData, projectDescription: e.target.value })}
+                      className="w-full bg-zinc-800 border border-zinc-700 rounded-xl p-3 text-xs text-white focus:outline-none focus:border-indigo-500 resize-none" />
+                  </div>
+                  <div>
+                    <label className="text-xs text-zinc-400 mb-1 block font-medium">Interests &amp; hobbies (comma-separated)</label>
+                    <input placeholder="e.g. Open source, Chess, Robotics club" value={onboardData.interests}
+                      onChange={e => setOnboardData({ ...onboardData, interests: e.target.value })}
+                      className="w-full bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-indigo-500" />
+                  </div>
+                </div>
+              </div>
+            )}
+
+            </motion.div>
+            </AnimatePresence>
+
+            {onboardErrors.length > 0 && (
+              <div className="mt-4 p-3 rounded-xl bg-red-500/10 border border-red-500/30 space-y-1" role="alert">
+                {onboardErrors.map(e => <p key={e} className="text-red-300 text-xs flex items-start gap-1.5"><AlertCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />{e}</p>)}
+              </div>
+            )}
+            {errorMessage && onboardErrors.length === 0 && <p className="text-red-400 text-xs mt-3">{errorMessage}</p>}
 
             <div className="flex justify-between mt-8 pt-5 border-t border-zinc-800">
-              <button disabled={onboardStep === 1} onClick={() => setOnboardStep(p => p - 1)}
+              <button disabled={onboardStep === 1} onClick={() => { setOnboardErrors([]); setOnboardStep(p => p - 1); }}
                 className="px-4 py-2 border border-zinc-700 hover:bg-zinc-800 rounded-xl text-xs font-semibold disabled:opacity-30 cursor-pointer">
                 Back
               </button>
-              {onboardStep < 3
-                ? <button onClick={() => setOnboardStep(p => p + 1)} className="px-5 py-2 bg-gradient-to-r from-indigo-600 to-violet-600 text-white rounded-xl text-xs font-semibold flex items-center gap-1 cursor-pointer">
+              {onboardStep < 4
+                ? <button onClick={() => { const errs = validateOnboardStep(onboardStep); setOnboardErrors(errs); if (!errs.length) setOnboardStep(p => p + 1); }} className="px-5 py-2 bg-gradient-to-r from-indigo-600 to-violet-600 text-white rounded-xl text-xs font-semibold flex items-center gap-1 cursor-pointer">
                     Continue <ChevronRight className="w-3.5 h-3.5" />
                   </button>
-                : <button onClick={handleOnboard} disabled={loading} className="px-5 py-2 bg-gradient-to-r from-indigo-600 to-violet-600 text-white rounded-xl text-xs font-semibold cursor-pointer">
+                : <button onClick={() => { const errs = [1, 2, 3, 4].flatMap(validateOnboardStep); setOnboardErrors(errs); if (!errs.length) handleOnboard(); }} disabled={loading} className="px-5 py-2 bg-gradient-to-r from-indigo-600 to-violet-600 text-white rounded-xl text-xs font-semibold cursor-pointer">
                     {loading ? 'Generating Roadmap...' : 'Launch Dashboard'}
                   </button>
               }
+            </div>
             </div>
           </div>
         </div>
@@ -2857,7 +3452,6 @@ public:
                   ['coding', 'Coding Practice', Code2],
                   ['interview', 'Mock Interview', Video],
                   ['mentor', 'AI Coach', MessageSquare],
-                  ['admin', 'Admin Panel', ShieldAlert],
                   ['profile', 'Settings', Settings],
                 ] as [SidebarTab, string, any][]).map(([id, label, Icon]) => (
                   <button key={id} onClick={() => setSidebarTab(id)}
@@ -2998,6 +3592,31 @@ public:
 
                 return (
                   <div className="space-y-6">
+                    {/* Daily coding challenge */}
+                    {dailyChallenge && (
+                      <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}
+                        className={`border rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${dailyChallenge.completed_today ? 'bg-emerald-500/5 border-emerald-500/25' : 'bg-gradient-to-r from-amber-500/10 to-orange-500/5 border-amber-500/25'}`}>
+                        <div className="flex items-center gap-3">
+                          <div className="w-10 h-10 rounded-xl bg-amber-500/15 border border-amber-500/30 flex items-center justify-center flex-shrink-0">
+                            <Flame className="w-5 h-5 text-amber-400" />
+                          </div>
+                          <div>
+                            <div className="text-[10px] uppercase tracking-wider font-black text-amber-400">Today's challenge · +{dailyChallenge.bonus_xp} bonus XP</div>
+                            <div className="text-sm font-bold text-white">{dailyChallenge.title}</div>
+                            <div className="text-[11px] text-zinc-400">{dailyChallenge.difficulty} · {dailyChallenge.category}</div>
+                          </div>
+                        </div>
+                        {dailyChallenge.completed_today ? (
+                          <span className="text-xs font-bold text-emerald-400 flex items-center gap-1"><CheckCircle2 className="w-4 h-4" /> Solved today. See you tomorrow!</span>
+                        ) : (
+                          <button type="button" onClick={() => { setSidebarTab('coding'); selectProblem(dailyChallenge.id); }}
+                            className="px-4 py-2 bg-amber-500 hover:bg-amber-600 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 cursor-pointer">
+                            <Code2 className="w-3.5 h-3.5" /> Solve now
+                          </button>
+                        )}
+                      </motion.div>
+                    )}
+
                     {/* Hero Header & Quick Action Launcher */}
                     <div className="bg-gradient-to-r from-zinc-900 via-zinc-900/90 to-zinc-900 border border-zinc-800 rounded-3xl p-6 relative overflow-hidden shadow-xl">
                       <div className="absolute top-0 right-0 w-96 h-96 bg-indigo-600/10 rounded-full blur-3xl pointer-events-none" />
@@ -3516,6 +4135,43 @@ public:
                     </div>
                   </div>
 
+                  {roadmap?.study_plan?.weeks?.length > 0 && (
+                    <details className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 group" open>
+                      <summary className="flex items-center justify-between gap-3 cursor-pointer list-none">
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <Clock className="w-4 h-4 text-indigo-400" />
+                            <h4 className="text-sm font-bold text-white">Your week-by-week plan</h4>
+                            <span className={`text-[10px] font-bold px-2 py-0.5 rounded border ${roadmap.study_plan.summary.on_track ? 'text-emerald-300 bg-emerald-500/10 border-emerald-500/25' : 'text-amber-300 bg-amber-500/10 border-amber-500/25'}`}>
+                              {roadmap.study_plan.summary.on_track ? 'On track' : 'Behind schedule'}
+                            </span>
+                          </div>
+                          <p className="text-xs text-zinc-400 mt-1">{roadmap.study_plan.summary.message}</p>
+                        </div>
+                        <ChevronDown className="w-4 h-4 text-zinc-500 group-open:rotate-180 transition-transform" />
+                      </summary>
+                      <div className="mt-4 flex gap-3 overflow-x-auto pb-2">
+                        {roadmap.study_plan.weeks.slice(0, 12).map((w: any) => (
+                          <div key={w.week} className="min-w-[200px] max-w-[220px] bg-zinc-950 border border-zinc-800 rounded-xl p-3 flex-shrink-0">
+                            <div className="flex items-center justify-between">
+                              <span className="text-[10px] font-black uppercase tracking-wider text-indigo-400">Week {w.week}</span>
+                              <span className="text-[10px] text-zinc-500">from {w.starts}</span>
+                            </div>
+                            <div className="text-[10px] text-zinc-400 mt-0.5 truncate" title={w.focus}>{w.focus} · {w.hours}h</div>
+                            <ul className="mt-2 space-y-1">
+                              {w.topics.map((t: any) => (
+                                <li key={t.topic_id} className="text-[11px] text-zinc-200 leading-snug">• {t.title}</li>
+                              ))}
+                            </ul>
+                          </div>
+                        ))}
+                        {roadmap.study_plan.weeks.length > 12 && (
+                          <div className="min-w-[140px] flex items-center justify-center text-xs text-zinc-500">+{roadmap.study_plan.weeks.length - 12} more weeks</div>
+                        )}
+                      </div>
+                    </details>
+                  )}
+
                   {roadmap?.stages_data ? (
                     <div className="space-y-4">
                       {roadmap.stages_data.map((stage: any) => {
@@ -3569,8 +4225,8 @@ public:
                                         {topic.is_completed && <span className="text-[9px] font-bold text-green-400 bg-green-500/10 px-1.5 py-0.5 rounded border border-green-500/20">+50 XP Earned</span>}
                                       </div>
                                       <p className="text-[11px] text-zinc-400 mt-1 leading-relaxed">{topic.description}</p>
-                                      {topic.already_familiar && !topic.is_completed && (
-                                        <span className="inline-block mt-1 text-[9px] font-bold text-sky-300 bg-sky-500/10 border border-sky-500/20 px-1.5 py-0.5 rounded">You listed this skill: a quick revision may be enough</span>
+                                      {topic.personal_tip && !topic.is_completed && (
+                                        <span className="inline-block mt-1 text-[10px] font-semibold text-sky-300 bg-sky-500/10 border border-sky-500/20 px-1.5 py-0.5 rounded">💡 {topic.personal_tip}</span>
                                       )}
                                       {Array.isArray(topic.concepts) && topic.concepts.length > 0 && (
                                         <div className="flex flex-wrap gap-1 mt-2">
@@ -3704,6 +4360,47 @@ public:
                   </div>
 
                   {/* ── 1. UPLOAD & AUDIT EXISTING PDF ── */}
+                  {/* Job description match */}
+                  <details className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5 group">
+                    <summary className="flex items-center justify-between cursor-pointer list-none">
+                      <div className="flex items-center gap-2">
+                        <Target className="w-4 h-4 text-emerald-400" />
+                        <span className="text-sm font-bold text-white">Match your resume to a job description</span>
+                        <span className="text-[10px] text-zinc-500 hidden sm:inline">Paste a job posting and see what's missing</span>
+                      </div>
+                      <ChevronDown className="w-4 h-4 text-zinc-500 group-open:rotate-180 transition-transform" />
+                    </summary>
+                    <div className="mt-4 space-y-3">
+                      <textarea rows={4} value={jdText} onChange={e => setJdText(e.target.value)}
+                        placeholder="Paste the full job description here (responsibilities, requirements, tech stack)…"
+                        className="w-full bg-zinc-800 border border-zinc-700 rounded-xl p-3 text-xs text-white focus:outline-none focus:border-indigo-500 resize-none" />
+                      <button type="button" onClick={runJdMatch} disabled={jdLoading || jdText.trim().length < 30}
+                        className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 disabled:opacity-40 cursor-pointer">
+                        {jdLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Target className="w-3.5 h-3.5" />} {jdLoading ? 'Comparing…' : 'Check my match'}
+                      </button>
+                      {jdResult && (
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                          <div className="p-4 bg-zinc-950 border border-zinc-800 rounded-xl text-center">
+                            <div className="text-[10px] uppercase font-bold text-zinc-400">Keyword match</div>
+                            <div className={`text-3xl font-black font-mono ${jdResult.match_score >= 75 ? 'text-emerald-400' : jdResult.match_score >= 55 ? 'text-amber-400' : 'text-red-400'}`}>{jdResult.match_score}%</div>
+                            <div className="text-xs text-zinc-300 font-semibold">{jdResult.verdict}</div>
+                            {jdResult.ai_summary && <p className="text-[11px] text-zinc-400 mt-2 text-left">{jdResult.ai_summary}</p>}
+                          </div>
+                          <div className="p-4 bg-zinc-950 border border-zinc-800 rounded-xl">
+                            <div className="text-[10px] uppercase font-bold text-emerald-400 mb-1.5">You already have</div>
+                            <div className="flex flex-wrap gap-1">{jdResult.matched_keywords.map((k: string) => <span key={k} className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/25 text-emerald-300">{k}</span>)}</div>
+                            <div className="text-[10px] uppercase font-bold text-red-400 mt-3 mb-1.5">Missing from your resume</div>
+                            <div className="flex flex-wrap gap-1">{jdResult.missing_keywords.length ? jdResult.missing_keywords.map((k: string) => <span key={k} className="text-[10px] px-1.5 py-0.5 rounded bg-red-500/10 border border-red-500/25 text-red-300">{k}</span>) : <span className="text-[11px] text-zinc-400">Nothing important. Nice!</span>}</div>
+                          </div>
+                          <div className="p-4 bg-zinc-950 border border-zinc-800 rounded-xl">
+                            <div className="text-[10px] uppercase font-bold text-indigo-400 mb-1.5">How to improve</div>
+                            <ul className="space-y-1.5">{jdResult.suggestions.map((t: string, i: number) => <li key={i} className="text-[11px] text-zinc-300 leading-relaxed">• {t}</li>)}</ul>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </details>
+
                   {resumeMode === 'upload' && (
                     <div className="space-y-6">
                       {/* Upload Box or Confirmed State Card */}
@@ -5021,6 +5718,7 @@ public:
                                 className="bg-zinc-900 border border-zinc-700 text-zinc-200 rounded-lg px-2.5 py-1 text-xs font-semibold focus:outline-none focus:border-indigo-500 cursor-pointer"
                               >
                                 <option value="python">Python 3</option>
+                                <option value="c">C (GCC, C11)</option>
                                 <option value="cpp">C++ (GCC, C++17)</option>
                                 <option value="java">Java (OpenJDK 17)</option>
                                 <option value="javascript">JavaScript (Node.js)</option>
@@ -5065,6 +5763,15 @@ public:
                                 setAutoSaveStatus('Saving...');
                               }}
                               onSyntaxErrorChange={(errors) => setSyntaxErrorsCount(errors.length)}
+                              onClipboardBlocked={(action) => {
+                                // Report to the admin audit log, at most once every 10 seconds
+                                const now = Date.now();
+                                if (!activeProblem || !token || now - clipLogRef.current < 10000) return;
+                                clipLogRef.current = now;
+                                fetch(`${BACKEND_URL}/coding/problems/${activeProblem.id}/clipboard-blocked`, {
+                                  method: 'POST', headers: authHeaders(), body: JSON.stringify({ action }),
+                                }).catch(() => {});
+                              }}
                             />
                           </div>
 
@@ -5612,6 +6319,11 @@ public:
                         </div>
                       </div>
 
+                      <div className="p-3 rounded-2xl border border-amber-500/25 bg-amber-500/5 text-[11px] text-amber-200 flex items-start gap-2">
+                        <ShieldAlert className="w-4 h-4 flex-shrink-0 mt-0.5 text-amber-400" />
+                        <span>Proctored interview: it opens in <b>full screen</b>. Switching tabs or apps, pasting answers, another person or a phone in view, and background movement are detected and shown in your integrity report.</span>
+                      </div>
+
                       {/* Start Interview Button */}
                       <button
                         type="button"
@@ -5763,13 +6475,47 @@ public:
                             {/* Leave Call Button */}
                             <button
                               type="button"
-                              onClick={() => submitAnswerWithText('Thank you, I would like to conclude the interview.')}
+                              onClick={endInterviewNow}
                               className="px-3 py-1.5 bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/30 text-xs font-bold rounded-xl transition-all flex items-center gap-1.5 cursor-pointer"
                             >
                               <PhoneOff className="w-3.5 h-3.5" />
                               <span className="hidden md:inline">Leave Call</span>
                             </button>
                           </div>
+                        </div>
+
+                        {/* Full-screen lock */}
+                        {fsBlocked && (
+                          <div className="fixed inset-0 z-[100] bg-black/90 backdrop-blur-sm flex items-center justify-center p-6" role="dialog" aria-modal="true">
+                            <div className="max-w-md w-full bg-zinc-900 border border-red-500/40 rounded-3xl p-7 text-center space-y-4">
+                              <ShieldAlert className="w-10 h-10 text-red-400 mx-auto" />
+                              <h3 className="text-lg font-black text-white">Return to full screen to continue</h3>
+                              <p className="text-xs text-zinc-400">The interview runs in full screen to keep it fair. Leaving full screen or switching apps is recorded in your integrity report.</p>
+                              <div className="flex gap-2 justify-center">
+                                <button type="button" onClick={enterFullscreen} className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold cursor-pointer">Return to full screen</button>
+                                <button type="button" onClick={endInterviewNow} className="px-5 py-2.5 border border-zinc-700 text-zinc-300 hover:bg-zinc-800 rounded-xl text-xs font-bold cursor-pointer">End interview</button>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Integrity monitoring */}
+                        <AnimatePresence>
+                          {integrityAlert && (
+                            <motion.div initial={{ opacity: 0, y: -6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
+                              className="p-3 rounded-2xl bg-red-500/10 border border-red-500/40 text-red-300 text-xs font-semibold flex items-center gap-2" role="alert">
+                              <ShieldAlert className="w-4 h-4 flex-shrink-0" /> {integrityAlert}
+                            </motion.div>
+                          )}
+                        </AnimatePresence>
+                        <div className="flex items-center gap-2 text-[10px] text-zinc-500 -mt-1">
+                          <ShieldAlert className="w-3 h-3" />
+                          <span>Integrity monitor: {faceStatus === 'active' || faceStatus === 'no-face' ? 'on' : 'starts when face analysis is active'}</span>
+                          {Object.values(integrityCounts).reduce((a, b) => a + b, 0) > 0 && (
+                            <span className="text-amber-400 font-semibold">
+                              · {Object.values(integrityCounts).reduce((a, b) => a + b, 0)} warning(s): {Object.entries(integrityCounts).filter(([, n]) => n > 0).map(([k, n]) => `${k.replace('_', ' ')} ×${n}`).join(', ')}
+                            </span>
+                          )}
                         </div>
 
                         {/* 2. DUAL-TILE VIDEO CONFERENCE STAGE */}
@@ -5868,7 +6614,7 @@ public:
                               </div>
 
                               <div className="mt-2 text-[11px] font-semibold text-zinc-400">
-                                {isAiSpeaking ? 'Alex is speaking…' : loading ? 'Thinking about your answer…' : 'Listening. Take your time.'}
+                                {isAiSpeaking ? 'Alex is speaking…' : voiceLoading ? 'Alex is about to speak…' : loading ? 'Thinking about your answer…' : 'Listening. Take your time.'}
                               </div>
                             </div>
 
@@ -5878,8 +6624,8 @@ public:
                                 <Cpu className="w-3 h-3 text-indigo-400" />
                                 Follow-ups adapt to your answers
                               </span>
-                              <span className="text-[10px] font-mono text-zinc-500">
-                                {currentDifficulty} level
+                              <span className="text-[10px] font-mono text-zinc-500" title={voiceQuota ? "Today's free natural-voice limit is used up; a backup voice is speaking. It resets daily." : ''}>
+                                {voiceQuota ? 'Backup voice (daily limit reached)' : `${currentDifficulty} level`}
                               </span>
                             </div>
                           </div>
@@ -6099,6 +6845,8 @@ public:
                               <input
                                 value={candidateResponse}
                                 onChange={e => setCandidateResponse(e.target.value)}
+                                onPaste={e => { e.preventDefault(); logIntegrity('paste_attempt'); }}
+                                onDrop={e => e.preventDefault()}
                                 onKeyDown={e => e.key === 'Enter' && !e.shiftKey && submitAnswer()}
                                 placeholder={isRecording ? 'Listening to speech... (or type your technical answer here)' : 'Speak your answer using the microphone, or type here... (Press Enter to submit)'}
                                 className="w-full bg-zinc-950 border border-zinc-800 focus:border-indigo-500 rounded-xl pl-4 pr-10 py-3 text-xs text-white placeholder-zinc-500 focus:outline-none transition-colors"
@@ -6117,7 +6865,9 @@ public:
                             {/* Mic Toggle Button */}
                             <button
                               type="button"
-                              onClick={isRecording ? stopVoiceRecording : startVoiceRecording}
+                              onClick={isRecording
+                                ? () => { const text = candidateTextRef.current.trim(); stopVoiceRecording(); if (text) submitAnswerWithText(text); }
+                                : () => startVoiceRecording()}
                               className={`px-4 py-3 rounded-xl font-bold text-xs flex items-center gap-2 border transition-all cursor-pointer ${
                                 isRecording
                                   ? 'bg-red-600 hover:bg-red-500 text-white border-red-500 shadow-lg shadow-red-600/30 animate-pulse'
@@ -6152,7 +6902,7 @@ public:
                           {/* Mic Button */}
                           <button
                             type="button"
-                            onClick={isRecording ? stopVoiceRecording : startVoiceRecording}
+                            onClick={isRecording ? stopVoiceRecording : () => startVoiceRecording()}
                             className={`p-3 rounded-xl border text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
                               isRecording
                                 ? 'bg-red-600 text-white border-red-500 shadow-lg shadow-red-600/30'
@@ -6162,6 +6912,19 @@ public:
                           >
                             {isRecording ? <Mic className="w-4 h-4" /> : <MicOff className="w-4 h-4 text-zinc-500" />}
                             <span className="hidden md:inline text-[11px]">{isRecording ? 'Mic Live' : 'Mute'}</span>
+                          </button>
+
+                          {/* Auto mic: opens the mic when the interviewer finishes */}
+                          <button
+                            type="button"
+                            onClick={toggleAutoMic}
+                            className={`p-3 rounded-xl border text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+                              autoMic ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400' : 'bg-zinc-900 border-zinc-800 text-zinc-500 hover:bg-zinc-800'
+                            }`}
+                            title={autoMic ? 'The mic turns on by itself after each question. Click to turn off.' : 'Click to turn the mic on automatically after each question.'}
+                          >
+                            <Wand2 className="w-4 h-4" />
+                            <span className="hidden md:inline text-[11px]">Auto mic {autoMic ? 'on' : 'off'}</span>
                           </button>
 
                           {/* Camera Button */}
@@ -6209,6 +6972,16 @@ public:
                             <span className="hidden md:inline text-[11px]">{audioOutputEnabled ? 'Voice Mode' : 'Muted'}</span>
                           </button>
 
+                          {/* Voice speed */}
+                          <div className="flex items-center rounded-xl border border-zinc-800 bg-zinc-900 p-1" role="group" aria-label="Interviewer voice speed">
+                            {SPEEDS.map(sp => (
+                              <button key={sp} type="button" onClick={() => setSpeed(sp)} title={`Interviewer speaks at ${sp}x`}
+                                className={`px-2 py-1.5 rounded-lg text-[10px] font-bold transition-colors cursor-pointer ${voiceSpeed === sp ? 'bg-indigo-600 text-white' : 'text-zinc-400 hover:text-zinc-200'}`}>
+                                {sp}x
+                              </button>
+                            ))}
+                          </div>
+
                           {/* Meeting Chat / Transcript Drawer Toggle */}
                           <button
                             type="button"
@@ -6232,7 +7005,7 @@ public:
                           {/* Leave Call */}
                           <button
                             type="button"
-                            onClick={() => submitAnswerWithText('Thank you, I would like to conclude the interview.')}
+                            onClick={endInterviewNow}
                             className="p-3 bg-red-600 hover:bg-red-500 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all shadow-md shadow-red-600/30 cursor-pointer"
                             title="End Interview"
                           >
@@ -6474,6 +7247,16 @@ public:
                         </div>
                       )}
 
+                      {/* Integrity report */}
+                      {interviewFeedback.behavior_scores?.integrity && (
+                        <div className={`border rounded-3xl p-5 shadow-xl space-y-2 ${interviewFeedback.behavior_scores.integrity.flagged ? 'bg-red-500/5 border-red-500/30' : 'bg-zinc-900/90 border-zinc-800'}`}>
+                          <div className={`text-xs font-bold uppercase tracking-wider flex items-center gap-2 ${interviewFeedback.behavior_scores.integrity.flagged ? 'text-red-400' : 'text-emerald-400'}`}>
+                            <ShieldAlert className="w-4 h-4" /> Interview integrity: {interviewFeedback.behavior_scores.integrity.flagged ? 'issues detected' : 'no issues'}
+                          </div>
+                          <p className="text-xs text-zinc-300">{interviewFeedback.behavior_scores.integrity.summary}</p>
+                        </div>
+                      )}
+
                       {/* Body language (only when face analysis ran) */}
                       {interviewFeedback.behavior_scores?.aggregate?.has_face_data && (
                         <div className="bg-zinc-900/90 border border-zinc-800 rounded-3xl p-5 shadow-xl space-y-3">
@@ -6572,6 +7355,14 @@ public:
                                 <>
                                   <Sparkles className="w-3 h-3 text-indigo-400" />
                                   <span>🤖 GapX AI Coach</span>
+                                  {m.spoken && (
+                                    <button type="button"
+                                      onClick={() => { if (coachSpeakingIdx === i) { stopSpeaking(); setCoachSpeakingIdx(null); } else speakCoachAnswer(m.spoken!, i); }}
+                                      className="ml-auto normal-case tracking-normal flex items-center gap-1 text-indigo-400 hover:text-indigo-300 cursor-pointer"
+                                      title={coachSpeakingIdx === i ? 'Stop' : 'Listen to the answer'}>
+                                      {coachSpeakingIdx === i ? <><VolumeX className="w-3 h-3" /> Stop</> : <><Volume2 className="w-3 h-3" /> Listen</>}
+                                    </button>
+                                  )}
                                 </>
                               ) : (
                                 <>
@@ -6627,10 +7418,29 @@ public:
                               sendMentor();
                             }
                           }}
-                          placeholder="Ask about coding problems, career roadmaps, interview answers..."
+                          placeholder={coachListening ? 'Listening… speak your question' : 'Ask about coding, CS topics, interviews, your resume or roadmap…'}
                           disabled={mentorLoading}
                           className="flex-1 bg-zinc-800 border border-zinc-700 rounded-xl px-4 py-2.5 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-indigo-500 transition-colors disabled:opacity-50"
                         />
+                        <button
+                          type="button"
+                          onClick={coachListening ? stopCoachListening : startCoachListening}
+                          disabled={mentorLoading}
+                          title={coachListening ? 'Stop listening' : 'Ask by voice'}
+                          aria-label={coachListening ? 'Stop listening' : 'Ask by voice'}
+                          className={`p-2.5 rounded-xl border transition-all cursor-pointer flex items-center justify-center min-w-[42px] disabled:opacity-40 ${coachListening ? 'bg-red-600 border-red-500 text-white animate-pulse' : 'bg-zinc-800 border-zinc-700 text-indigo-400 hover:bg-zinc-700'}`}
+                        >
+                          {coachListening ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => { if (coachVoiceReplies) { stopSpeaking(); setCoachSpeakingIdx(null); } setCoachVoiceReplies(v => !v); }}
+                          title={coachVoiceReplies ? 'Reading every answer aloud (click to turn off)' : 'Answers are silent. Click to read every answer aloud, or use Listen on any answer'}
+                          aria-label="Toggle spoken answers"
+                          className={`p-2.5 rounded-xl border transition-all cursor-pointer flex items-center justify-center min-w-[42px] ${coachVoiceReplies ? 'bg-indigo-500/15 border-indigo-500/40 text-indigo-300' : 'bg-zinc-800 border-zinc-700 text-zinc-500'}`}
+                        >
+                          {coachVoiceReplies ? <Volume2 className="w-4 h-4" /> : <VolumeX className="w-4 h-4" />}
+                        </button>
                         <button
                           type="button"
                           onClick={() => sendMentor()}
@@ -6641,60 +7451,6 @@ public:
                         </button>
                       </div>
                     </div>
-                  </div>
-                </div>
-              )}
-
-              {/* ── ADMIN ── */}
-              {sidebarTab === 'admin' && (
-                <div className="space-y-5 max-w-2xl">
-                  <div className="p-4 bg-amber-500/10 border border-amber-500/20 text-amber-400 rounded-xl text-xs font-semibold flex items-center gap-3">
-                    <ShieldAlert className="w-5 h-5 flex-shrink-0" />
-                    Admin Panel — Use email starting with "admin" to access this panel.
-                  </div>
-                  <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-5">
-                    <div className="text-xs font-bold uppercase tracking-wider mb-4">Add New Coding Problem</div>
-                    <form onSubmit={createProblem} className="space-y-3 text-xs">
-                      <div className="grid grid-cols-2 gap-3">
-                        <div>
-                          <label className="text-zinc-400 block mb-1">Title</label>
-                          <input value={newProblem.title} onChange={e => setNewProblem({ ...newProblem, title: e.target.value })} required
-                            className="w-full bg-zinc-800 border border-zinc-700 rounded-lg p-2 text-white focus:outline-none" />
-                        </div>
-                        <div>
-                          <label className="text-zinc-400 block mb-1">Category</label>
-                          <input value={newProblem.category} onChange={e => setNewProblem({ ...newProblem, category: e.target.value })} required
-                            className="w-full bg-zinc-800 border border-zinc-700 rounded-lg p-2 text-white focus:outline-none" />
-                        </div>
-                      </div>
-                      <div>
-                        <label className="text-zinc-400 block mb-1">Difficulty</label>
-                        <select value={newProblem.difficulty} onChange={e => setNewProblem({ ...newProblem, difficulty: e.target.value })}
-                          className="w-full bg-zinc-800 border border-zinc-700 rounded-lg p-2 text-white focus:outline-none">
-                          <option>Easy</option><option>Medium</option><option>Hard</option>
-                        </select>
-                      </div>
-                      <div>
-                        <label className="text-zinc-400 block mb-1">Problem Statement</label>
-                        <textarea value={newProblem.problem_statement} onChange={e => setNewProblem({ ...newProblem, problem_statement: e.target.value })} required
-                          className="w-full bg-zinc-800 border border-zinc-700 rounded-lg p-2 text-white h-20 resize-none focus:outline-none" />
-                      </div>
-                      <div className="grid grid-cols-2 gap-3">
-                        <div>
-                          <label className="text-zinc-400 block mb-1">Example Input</label>
-                          <input value={newProblem.example_input} onChange={e => setNewProblem({ ...newProblem, example_input: e.target.value })} required
-                            className="w-full bg-zinc-800 border border-zinc-700 rounded-lg p-2 text-white focus:outline-none" />
-                        </div>
-                        <div>
-                          <label className="text-zinc-400 block mb-1">Example Output</label>
-                          <input value={newProblem.example_output} onChange={e => setNewProblem({ ...newProblem, example_output: e.target.value })} required
-                            className="w-full bg-zinc-800 border border-zinc-700 rounded-lg p-2 text-white focus:outline-none" />
-                        </div>
-                      </div>
-                      <button type="submit" disabled={loading} className="w-full py-2 bg-gradient-to-r from-indigo-600 to-violet-600 text-white font-bold rounded-xl">
-                        {loading ? 'Adding...' : 'Add Problem to Database'}
-                      </button>
-                    </form>
                   </div>
                 </div>
               )}
@@ -6804,7 +7560,7 @@ public:
                   </button>
                   <button
                     type="button"
-                    onClick={() => setSelectedNotesTopic(null)}
+                    onClick={() => { stopSpeaking(); setSelectedNotesTopic(null); }}
                     className="p-2 text-zinc-400 hover:text-white rounded-xl bg-zinc-800 hover:bg-zinc-700 transition-colors cursor-pointer"
                   >
                     <X className="w-5 h-5" />
@@ -6829,8 +7585,28 @@ public:
                         <span className="flex items-center gap-2"><PlayCircle className="w-4 h-4" /> Concept explainer: an animated, narrated lesson for this topic</span>
                         {explainerOpen ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
                       </button>
-                      {explainerOpen && <ConceptPlayer notes={activeNotes} topicTitle={activeNotes.title || selectedNotesTopic.title} />}
+                      {explainerOpen && <ConceptPlayer notes={activeNotes} topicTitle={activeNotes.title || selectedNotesTopic.title} apiBase={BACKEND_URL} token={token} />}
                     </div>
+
+                    {/* Every idea explained in simple words */}
+                    {Array.isArray(activeNotes.explained) && activeNotes.explained.length > 0 && (
+                      <div className="bg-zinc-950/70 border border-zinc-800 rounded-xl p-5">
+                        <div className="flex items-center gap-2 text-sky-400 text-xs font-bold uppercase tracking-wider mb-3">
+                          <Lightbulb className="w-4 h-4" /> Explained simply
+                        </div>
+                        <div className="space-y-3">
+                          {activeNotes.explained.map((e: any, i: number) => (
+                            <div key={i} className="flex gap-3">
+                              <div className="w-6 h-6 rounded-full bg-sky-500/15 border border-sky-500/30 text-sky-300 text-[11px] font-black flex items-center justify-center flex-shrink-0">{i + 1}</div>
+                              <div>
+                                <div className="text-sm font-bold text-white">{e.point}</div>
+                                <p className="text-xs sm:text-sm text-zinc-300 leading-relaxed mt-0.5">{e.explanation}</p>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
 
                     {/* Last-minute revision notes */}
                     {Array.isArray(activeNotes.last_minute_notes) && activeNotes.last_minute_notes.length > 0 && (
@@ -7082,7 +7858,7 @@ public:
                 <span className="text-[11px] text-zinc-500">GapX AI Placement Preparation Engine</span>
                 <button
                   type="button"
-                  onClick={() => setSelectedNotesTopic(null)}
+                  onClick={() => { stopSpeaking(); setSelectedNotesTopic(null); }}
                   className="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 text-white rounded-xl text-xs font-bold transition-all cursor-pointer"
                 >
                   Close Notes

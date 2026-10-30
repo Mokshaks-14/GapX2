@@ -1,12 +1,14 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
-from typing import List
+from typing import List, Optional
+from pydantic import BaseModel
 from app import models, schemas
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.services.judge0 import CodeExecutionService
 from app.services.ai_service import AIService
 from app.services.gamification import record_activity
+from app.services.audit import log_event
 import random
 
 router = APIRouter(prefix="/coding", tags=["Coding Practice Module"])
@@ -45,6 +47,38 @@ def public_problem(p: models.CodingProblem) -> schemas.CodingProblemBase:
     data["hints"] = p.hints or []
     return schemas.CodingProblemBase(**data)
 
+def daily_problem(db: Session, user: models.User) -> Optional[models.CodingProblem]:
+    """Today's challenge: same for the whole day, unsolved if possible, difficulty matched to the user's level."""
+    import datetime, hashlib
+    problems = db.query(models.CodingProblem).order_by(models.CodingProblem.id).all()
+    if not problems:
+        return None
+    today = datetime.datetime.combine(datetime.date.today(), datetime.time.min)
+    # Only problems solved before today are skipped, so today's pick stays the same after you solve it
+    solved = {s.problem_id for s in db.query(models.CodingSubmission).filter(
+        models.CodingSubmission.user_id == user.id, models.CodingSubmission.status == "Accepted",
+        models.CodingSubmission.created_at < today).all()}
+    level = (user.experience_level or "Beginner").lower()
+    wanted = {"beginner": ["Easy", "Medium"], "intermediate": ["Medium", "Easy"], "advanced": ["Medium", "Hard"]}.get(level, ["Easy", "Medium"])
+    pool = [p for p in problems if p.id not in solved and p.difficulty in wanted] or [p for p in problems if p.id not in solved] or problems
+    seed = int(hashlib.sha256(f"{datetime.date.today().isoformat()}-{user.id}".encode()).hexdigest(), 16)
+    return pool[seed % len(pool)]
+
+
+@router.get("/daily")
+def get_daily_challenge(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    p = daily_problem(db, current_user)
+    if not p:
+        raise HTTPException(status_code=404, detail="No problems available")
+    import datetime
+    start = datetime.datetime.combine(datetime.date.today(), datetime.time.min)
+    done = db.query(models.CodingSubmission).filter(models.CodingSubmission.user_id == current_user.id,
+                                                    models.CodingSubmission.problem_id == p.id,
+                                                    models.CodingSubmission.status == "Accepted",
+                                                    models.CodingSubmission.created_at >= start).first() is not None
+    return {"id": p.id, "title": p.title, "difficulty": p.difficulty, "category": p.category, "bonus_xp": 20, "completed_today": done}
+
+
 @router.get("/problems/{prob_id}", response_model=schemas.CodingProblemBase)
 def get_problem(
     prob_id: int,
@@ -55,6 +89,22 @@ def get_problem(
     if not p:
         raise HTTPException(status_code=404, detail="Problem not found")
     return public_problem(p)
+
+class ClipboardAttempt(BaseModel):
+    action: str = "paste"
+
+
+@router.post("/problems/{prob_id}/clipboard-blocked")
+def clipboard_blocked(prob_id: int, body: ClipboardAttempt, current_user: models.User = Depends(get_current_user),
+                      db: Session = Depends(get_db)):
+    """The editor blocked a copy/paste; recorded for the admin audit log."""
+    if body.action not in ("paste", "copy", "cut", "drop"):
+        raise HTTPException(status_code=400, detail="Unknown action")
+    p = db.query(models.CodingProblem).filter(models.CodingProblem.id == prob_id).first()
+    log_event("coding", f"{body.action}_blocked", user=current_user, severity="warning",
+              details={"problem": p.title if p else prob_id})
+    return {"ok": True}
+
 
 @router.post("/problems/{prob_id}/run", response_model=schemas.CodeSubmitResponse)
 def run_code(
@@ -131,6 +181,9 @@ def submit_code(
             
         if not prev_solved:
             xp_reward = 100 if p.difficulty == "Hard" else (50 if p.difficulty == "Medium" else 30)
+            daily = daily_problem(db, current_user)
+            if daily and daily.id == p.id:
+                xp_reward += 20  # daily challenge bonus
             current_user.xp += xp_reward
             record_activity(current_user)
             
@@ -154,7 +207,9 @@ def submit_code(
                 ))
 
     db.commit()
-    
+    log_event("coding", "submission", user=current_user,
+              details={"problem": p.title, "language": req.language, "status": res["status"]})
+
     return schemas.CodeSubmitResponse(
         status=res["status"],
         execution_time=res["execution_time"],

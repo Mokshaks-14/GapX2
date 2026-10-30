@@ -22,6 +22,13 @@ def _latest(db: Session, user: models.User):
         .order_by(models.Roadmap.created_at.desc()).first()
 
 
+def _respond(roadmap: models.Roadmap, user: models.User) -> schemas.RoadmapResponse:
+    """Roadmap plus a live, personalised week-by-week study plan."""
+    data = schemas.RoadmapResponse.model_validate(roadmap, from_attributes=True)
+    data.study_plan = roadmap_service.study_plan(roadmap.stages_data or [], user.preferred_learning_hours, user.expected_placement_date)
+    return data
+
+
 def _estimate_completion(stages, hours_per_day: int) -> str:
     total_hours = sum(t.get("estimated_hours", 4) for s in stages for t in s.get("topics", []) if not t.get("is_completed"))
     days = max(7, round(total_hours / max(1, hours_per_day or 2)))
@@ -34,7 +41,7 @@ def generate_roadmap(db: Session = Depends(get_db), current_user: models.User = 
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Please select target job roles first.")
     role = current_user.target_roles[0]
     built = roadmap_service.build_roadmap(role, current_user.skills or [])
-    stages = built["stages"]
+    stages = roadmap_service.personalise(built["stages"], current_user)
 
     existing = _latest(db, current_user)
     first_time = existing is None
@@ -63,12 +70,14 @@ def generate_roadmap(db: Session = Depends(get_db), current_user: models.User = 
         ))
     db.commit()
     db.refresh(roadmap)
-    return roadmap
+    return _respond(roadmap, current_user)
 
 
 @router.get("/current", response_model=schemas.RoadmapResponse)
 def get_current_roadmap(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
     roadmap = _latest(db, current_user)
+    if roadmap and current_user.target_roles and roadmap.target_role != current_user.target_roles[0]:
+        return generate_roadmap(db, current_user)
     if not roadmap:
         if current_user.target_roles:
             return generate_roadmap(db, current_user)
@@ -76,13 +85,14 @@ def get_current_roadmap(db: Session = Depends(get_db), current_user: models.User
     # Upgrade roadmaps created by older versions, keeping completed topics
     if not roadmap_service.is_current_format(roadmap.stages_data or []):
         built = roadmap_service.build_roadmap(roadmap.target_role, current_user.skills or [])
+        built["stages"] = roadmap_service.personalise(built["stages"], current_user)
         roadmap_service.carry_over_progress(roadmap.stages_data, built["stages"])
         roadmap.stages_data = built["stages"]
         roadmap.progress_percentage = roadmap_service.progress(built["stages"])
         flag_modified(roadmap, "stages_data")
         db.commit()
         db.refresh(roadmap)
-    return roadmap
+    return _respond(roadmap, current_user)
 
 
 @router.post("/toggle-topic", response_model=schemas.RoadmapResponse)
@@ -121,7 +131,7 @@ def toggle_topic(request: schemas.ToggleTopicRequest, db: Session = Depends(get_
     flag_modified(roadmap, "stages_data")
     db.commit()
     db.refresh(roadmap)
-    return roadmap
+    return _respond(roadmap, current_user)
 
 
 def _find_topic(roadmap, stage_id: str, topic_id: str):

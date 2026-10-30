@@ -37,19 +37,36 @@ class Settings(BaseSettings):
 
     # Comma-separated list of emails that are granted admin rights on login
     ADMIN_EMAILS: str = ""
+    # Admin account created/updated at startup for the separate admin panel (/admin)
+    ADMIN_EMAIL: str = ""
+    ADMIN_PASSWORD: str = ""
+
+    # Only allow sign-ups from real email domains (blocks look-alikes like mygmail.com and disposable inboxes)
+    EMAIL_DOMAIN_CHECK: bool = True
+
+    # Email verification codes at sign-up (sent over SMTP, e.g. Gmail with an App Password)
+    EMAIL_VERIFICATION_REQUIRED: bool = True
+    SMTP_HOST: str = ""          # smtp.gmail.com
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""          # the Gmail address that sends the codes
+    SMTP_PASSWORD: str = ""      # its 16-character App Password
+    SMTP_FROM: str = ""          # e.g. "GapX AI <yourapp@gmail.com>" (defaults to SMTP_USER)
 
     # Google Sign-In (OAuth client ID from Google Cloud console). Empty = Google login disabled.
     GOOGLE_CLIENT_ID: str = ""
-
-    # One-click demo account (handy for local development; disable in production)
-    ALLOW_DEMO_LOGIN: bool = True
 
     # Database: always resolves to backend/database.db unless overridden
     DATABASE_URL: str = f"sqlite:///{DEFAULT_DB_FILE.as_posix()}"
 
     # AI providers (optional — a built-in offline engine is used when none is configured)
     GEMINI_API_KEY: Optional[str] = ""
-    GEMINI_MODEL: str = "gemini-2.5-flash"
+    GEMINI_MODEL: str = "gemini-3.5-flash"              # AI Coach (quality)
+    GEMINI_FAST_MODEL: str = "gemini-flash-lite-latest"  # live interview, notes (speed)
+    GEMINI_FALLBACK_MODELS: str = "gemini-flash-latest,gemini-flash-lite-latest"
+    GEMINI_TTS_MODEL: str = "gemini-3.1-flash-tts-preview"  # natural voice for explainer & interviewer ("" = off)
+    GEMINI_TTS_FALLBACK_MODELS: str = "gemini-2.5-flash-preview-tts,gemini-3.8-flash-tts,gemini-2.5-pro-preview-tts"
+    OLLAMA_URL: str = "http://localhost:11434"
+    OLLAMA_MODEL: str = "llama3.2"
     OPENAI_API_KEY: Optional[str] = ""
     OPENAI_MODEL: str = "gpt-4o-mini"
 

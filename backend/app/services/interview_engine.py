@@ -55,6 +55,10 @@ INTRO_KW = [
 
 ACK_GOOD = ["Good answer.", "That's a solid explanation.", "Nice, that covers the key points.", "Great, that's clear."]
 ACK_OK = ["Okay, that's partly there.", "Fair enough, thanks.", "Alright.", "Thanks, I see where you're going."]
+GENERIC_TERMS = {"resource", "state", "data", "memory", "value", "model", "table", "system", "server", "query", "index",
+                 "example", "layer", "list", "array", "time", "result", "users", "project", "build", "code", "test", "function",
+                 "error", "update", "write", "read", "slow", "fast", "change", "class", "object", "node", "tree", "file", "image"}
+ACK_PROBE = ["Okay.", "Thanks.", "Got it.", "Alright."]
 ACK_LOW = ["No problem.", "Okay, let's keep going.", "That's alright, let's move on."]
 
 
@@ -75,13 +79,23 @@ def _lower(text: str) -> str:
     return f" {(text or '').lower()} "
 
 
+def _has(text: str, phrase: str) -> bool:
+    """Phrase match that respects word starts, so "post" doesn't match inside "postgresql"."""
+    phrase = phrase.lower()
+    if not phrase.strip():
+        return False
+    if not phrase[0].isalnum() or len(phrase.strip()) > 6:
+        return phrase in text
+    return re.search(r"(?<![a-z0-9])" + re.escape(phrase.strip()) + (r"(?![a-z0-9])" if len(phrase.strip()) <= 4 else ""), text) is not None
+
+
 def coverage(answer: str, groups: List[List[str]]) -> Tuple[List[str], List[str]]:
     """Returns (covered concept names, missing concept names) for an answer."""
     text = _lower(answer)
     covered, missing = [], []
     for group in groups:
         name, synonyms = group[0], group[1:] or group
-        (covered if any(s in text for s in synonyms) else missing).append(name)
+        (covered if any(_has(text, s) for s in synonyms) else missing).append(name)
     return covered, missing
 
 
@@ -100,12 +114,17 @@ def score_answer(answer: str, groups: List[List[str]]) -> Tuple[int, List[str], 
 
 
 def extract_tech(text: str) -> List[str]:
+    """Technologies mentioned in the text, as whole words, most specific first, in order of mention."""
     lowered = _lower(text)
-    found = []
+    hits = []
     for tech in TECH_LEXICON:
-        if tech in lowered and tech.strip() not in found:
-            found.append(tech.strip())
-    return found
+        t = tech.strip()
+        m = re.search(r"(?<![a-z0-9+#.])" + re.escape(t) + r"(?![a-z0-9+#])", lowered)
+        if m:
+            hits.append((m.start(), t))
+    names = [t for _, t in sorted(hits)]
+    # drop names contained in a longer match (e.g. "sql" inside "postgresql", "react" inside "react native")
+    return [t for t in dict.fromkeys(names) if not any(t != o and t in o for o in names)]
 
 
 def _pretty_tech(t: str) -> str:
@@ -143,7 +162,8 @@ class InterviewEngine:
     # ---------- start ----------
     @staticmethod
     def start(role: str, interview_type: str, experience_level: str, track_hint: Optional[str],
-              job_description: Optional[str], candidate_name: Optional[str], length: int = 8) -> Dict[str, Any]:
+              job_description: Optional[str], candidate_name: Optional[str], length: int = 8,
+              profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         track = detect_track(role, track_hint)
         is_fresher = (experience_level or "Fresher").lower() in ("fresher", "student", "entry level", "internship", "junior", "beginner")
         role_label = role.strip() if role and role.strip() else TRACKS[track]["label"]
@@ -153,23 +173,24 @@ class InterviewEngine:
             "type": interview_type or "Mixed", "is_fresher": is_fresher,
             "jd_terms": _jd_terms(job_description or ""), "job_description": (job_description or "")[:1500],
             "plan": plan, "plan_idx": 0, "difficulty": "Easy" if is_fresher else "Medium",
-            "asked_ids": [], "mentioned_tech": [], "followups_used": 0, "max_followups": 3,
-            "turns": [], "finished": False, "seed": random.randint(0, 10_000),
+            "asked_ids": [], "mentioned_tech": [], "followups_used": 0, "max_followups": max(3, len(plan) // 2),
+            "probed_tech": [], "turns": [], "finished": False, "seed": random.randint(0, 10_000),
+            "profile": profile or {},
+            "profile_terms": extract_tech(" ".join((profile or {}).get("skills", []) + [(profile or {}).get("project_stack") or ""])),
         }
         first_name = (candidate_name or "").split(" ")[0] if candidate_name else ""
-        greeting = f"Hi{(' ' + first_name) if first_name else ''}, I'm {INTERVIEWER}, and I'll be interviewing you for the {role_label} role today."
-        flow = {
-            "technical": "We'll talk about your background and a project you've built, then go through some technical questions and a problem-solving scenario.",
-            "hr": "This is a behavioral round, so I'll ask about your experiences, how you work with people, and what motivates you.",
-        }.get(state["type"].lower(), "We'll start with your background, go into a project you've built, cover some technical and behavioral questions, and leave time for your questions at the end.")
+        greeting = f"Hi{(' ' + first_name) if first_name else ''}, I'm {INTERVIEWER}, your interviewer for the {role_label} role."
+        prof = profile or {}
         if is_fresher:
-            ask = "To start, could you introduce yourself: your education, the skills you enjoy using, and a project you're proud of?"
+            rest = "Please introduce yourself and tell me about a project you're proud of."
         else:
-            ask = "To start, could you walk me through your background, your current or most recent role, and a project you're proud of?"
-        question = f"{greeting} {flow} There are no trick questions, so think out loud. {ask}"
+            rest = "Please walk me through your background and a recent project you're proud of."
+        if prof.get("skills"):
+            rest = f"I see you work with {', '.join(prof['skills'][:2])}. " + rest
+        question = f"{greeting} {rest}"
         state["current"] = {"kind": "intro", "qid": None, "topic": "Introduction", "text": question, "is_followup": False}
         return {"state": state, "question": question, "difficulty": state["difficulty"], "phase": "Introduction",
-                "total_questions": len(plan)}
+                "total_questions": len(plan), "speech_parts": [greeting, rest]}
 
     # ---------- answer ----------
     @staticmethod
@@ -208,18 +229,23 @@ class InterviewEngine:
 
         nxt = InterviewEngine._next_question(state, cur, answer, record)
         ack = InterviewEngine._acknowledge(state, record)
+        if nxt is not None and nxt.get("is_followup") and record["score"] < 72 and not record["dont_know"]:
+            ack = _pick(ACK_PROBE, state["seed"] + len(state["turns"]))
 
         # Let an LLM grade more precisely and phrase the next question naturally
         if llm.is_available():
             InterviewEngine._llm_enrich(state, cur, answer, record, nxt)
-            ack = record.get("llm_ack") or ack
+            # The spoken reaction stays a short stock phrase (its audio is cached, so it plays instantly)
 
         if nxt is None:
             return InterviewEngine._finish(state, f"{ack} That brings us to the end of the interview.")
 
         state["current"] = nxt
-        spoken = f"{ack} {nxt.get('transition', '')} {nxt['text']}".replace("  ", " ").strip()
-        return InterviewEngine._reply(state, spoken, feedback=record, diff_change=diff_change, next_text=nxt["text"])
+        question_part = f"{nxt.get('transition', '')} {nxt['text']}".replace("  ", " ").strip()
+        spoken = f"{ack} {question_part}".strip()
+        result = InterviewEngine._reply(state, spoken, feedback=record, diff_change=diff_change, next_text=nxt["text"])
+        result["speech_parts"] = [ack, question_part]
+        return result
 
     # ---------- evaluation ----------
     @staticmethod
@@ -282,7 +308,32 @@ class InterviewEngine:
     def _next_question(state: Dict[str, Any], cur: Dict[str, Any], answer: str, record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         seed = state["seed"] + len(state["turns"])
         plan_left = len(state["plan"]) - state["plan_idx"] - 1
-        can_follow = (not cur["is_followup"]) and state["followups_used"] < state["max_followups"] and plan_left > 1 and not record["dont_know"]
+        can_follow = (not cur["is_followup"]) and state["followups_used"] < state["max_followups"] and plan_left >= 1 and not record["dont_know"]
+
+        # 0) Any technology the candidate brings up gets probed, like a real interviewer would
+        if can_follow and cur["kind"] in ("deep_dive", "tech") and record["score"] >= 40:
+            probed = set(state.setdefault("probed_tech", []))
+            q = InterviewEngine._question_by_id(cur.get("qid"))
+            fu_triggers = {t for trig, _ in (q or {}).get("fu", []) for t in trig}
+            new_tech = [t for t in extract_tech(answer) if t not in probed and t not in fu_triggers and t not in ("html", "css", "excel")]
+            if new_tech and (cur["kind"] == "deep_dive" or len(new_tech) and not any(t in _lower(answer) for t in fu_triggers)):
+                tech = new_tech[0]
+                state["probed_tech"].append(tech)
+                state["followups_used"] += 1
+                pretty = _pretty_tech(tech)
+                text = _pick([
+                    f"You mentioned {pretty}. Why did you choose {pretty} there, and what limitations or trade-offs did you run into?",
+                    f"How does {pretty} work under the hood in what you built?",
+                    f"Let's stay on {pretty} for a moment. What's one problem you hit with it, and how did you debug it?",
+                ], seed)
+                return {"kind": cur["kind"], "parent_kind": cur["kind"], "qid": None, "topic": f"{pretty} (from your answer)",
+                        "is_followup": True, "text": text, "transition": "", "ideal": None}
+        if can_follow and cur["kind"] == "deep_dive" and record["score"] < 65:
+            state["followups_used"] += 1
+            missing = record["missing"][0] if record["missing"] else "the result"
+            return {"kind": "deep_dive", "parent_kind": "deep_dive", "qid": None, "topic": "Project Deep-Dive", "is_followup": True,
+                    "text": f"Tell me more about {missing}. How did you test that it worked?",
+                    "transition": "", "ideal": None}
 
         # 1) Follow-ups on main technical / behavioral questions
         if can_follow and cur["kind"] in ("tech", "scenario", "behavioral"):
@@ -314,7 +365,7 @@ class InterviewEngine:
 
         if kind == "closing":
             return {"kind": "closing", "qid": None, "topic": "Your questions", "is_followup": False, "transition": "",
-                    "text": "That's everything from my side. Do you have any questions for me about the role or the team?"}
+                    "text": "That's all from my side. Do you have any questions for me?"}
 
         if kind == "deep_dive":
             return InterviewEngine._deep_dive_question(state, seed)
@@ -324,10 +375,20 @@ class InterviewEngine:
             q = InterviewEngine._select_question(state, "tech", seed)
             if q is None:
                 return None
+        link = state.pop("_last_link", None)
+        if link and kind == "tech":
+            transition = _pick([f"Building on {link}:", f"Since you mentioned {link}:", f"Following up on {link}:"], seed)
+            return {"kind": kind, "qid": q["id"], "topic": q["topic"], "is_followup": False, "text": q["q"], "transition": transition}
+        project = (state.get("profile") or {}).get("project_title")
+        if kind == "behavioral" and q["id"] in ("bh-1", "bh-2", "bh-5") and (project or any(t["kind"] == "deep_dive" for t in state["turns"])):
+            ref = f"the {project} project" if project else "the project you described earlier"
+            return {"kind": kind, "qid": q["id"], "topic": q["topic"], "is_followup": False,
+                    "text": q["q"] + f" You can use {ref}.",
+                    "transition": "Now a behavioral question."}
         transition = {
-            "tech": _pick([f"Let's talk about {q['topic']}.", f"Next, a question on {q['topic']}.", f"Moving on to {q['topic']}."], seed),
+            "tech": _pick([f"Next, {q['topic']}.", f"Now, {q['topic']}.", f"On {q['topic']}:"], seed),
             "scenario": "",  # scenario questions introduce themselves
-            "behavioral": _pick(["Let's switch gears to a behavioral question.", "Now a question about how you work.", "Let's talk about your experiences."], seed),
+            "behavioral": _pick(["Now a behavioral question.", "About how you work:", "A question on teamwork:"], seed),
         }.get(kind, "")
         return {"kind": kind, "qid": q["id"], "topic": q["topic"], "is_followup": False, "text": q["q"], "transition": transition}
 
@@ -335,19 +396,22 @@ class InterviewEngine:
     def _deep_dive_question(state: Dict[str, Any], seed: int) -> Dict[str, Any]:
         intro = next((t["answer"] for t in state["turns"] if t["kind"] == "intro"), "")
         techs = [t for t in state["mentioned_tech"] if t not in ("html", "css", "excel")]
-        if len(intro.split()) < 12:
-            text = "Could you pick one project you've worked on and walk me through it: what it does, what you built yourself, and the tech stack?"
+        prof = state.get("profile") or {}
+        title, stack = prof.get("project_title"), prof.get("project_stack")
+        if title:
+            built = f", built with {stack}" if stack else ""
+            text = f"Tell me about your project {title}{built}: what you built and the hardest challenge you faced."
+        elif len(intro.split()) < 12:
+            text = "Pick one project you've built: what does it do, what was your part, and which tech did you use?"
         elif techs:
             tech = _pretty_tech(techs[0])
-            text = (f"You mentioned {tech}. In that project, what was the hardest technical problem you ran into with {tech}, "
-                    f"and how did you solve it?")
+            text = f"You mentioned {tech}. What was the hardest problem you hit with {tech}, and how did you solve it?"
         elif re.search(r"\bproject|built|developed|created\b", intro, re.I):
-            text = "Let's go deeper into that project. What was the architecture, which part did you personally build, and what's one decision you'd make differently today?"
+            text = "Let's go deeper: what was the architecture, which part did you build, and what would you change today?"
         else:
-            text = ("Tell me about a project you've built, in college or at work. What problem did it solve, what did you build yourself, "
-                    "and what was the hardest part?")
-        if not state["is_fresher"] and techs:
-            text += " And what impact did it have for users or the business?"
+            text = "Tell me about a project you've built: the problem it solved, your part, and the hardest bit."
+        if not state["is_fresher"] and techs and len(text.split()) < 20:
+            text += " What was the impact?"
         return {"kind": "deep_dive", "qid": None, "topic": "Project Deep-Dive", "is_followup": False, "text": text,
                 "transition": "", "ideal": "A strong project answer names the specific problem, the options you considered, what YOU built, the technology involved, and a measurable result or lesson."}
 
@@ -381,15 +445,43 @@ class InterviewEngine:
         target = state["difficulty"]
         if state["is_fresher"] and target == "Hard" and len([t for t in state["turns"] if t["kind"] == "tech"]) < 2:
             target = "Medium"
-        interests = set(state["jd_terms"]) | set(state["mentioned_tech"])
+        interests = set(state["jd_terms"]) | set(state["mentioned_tech"]) | set(state.get("profile_terms", []))
 
-        def rank(q: Dict[str, Any]) -> tuple:
+        # What the candidate just talked about (most recent answer counts double)
+        recent = [t["answer"] for t in state["turns"][-2:]]
+        weights = [1, 2][-len(recent):] if recent else []
+        recent_text = [(_lower(a), w) for a, w in zip(recent, weights)]
+
+        def relation(q: Dict[str, Any]) -> Tuple[int, Optional[str]]:
+            score, best = 0, None
+            for group in q["kw"]:
+                for syn in group[1:] or group:
+                    syn_l = syn.lower().strip()
+                    if len(syn_l) < 4 or syn_l in GENERIC_TERMS:
+                        continue
+                    for text, w in recent_text:
+                        if _has(text, syn_l):
+                            score += w
+                            best = best or syn_l
+                            break
+                    else:
+                        continue
+                    break
+            return score, best
+
+        def rank(q: Dict[str, Any]) -> float:
             text = (q["q"] + " " + " ".join(s for g in q["kw"] for s in g)).lower()
-            relevance = sum(1 for t in interests if t in text)
+            rel, _ = relation(q)
+            interest = sum(1 for t in interests if t in text)
             level_gap = abs(LEVELS.index(q["level"]) - LEVELS.index(target))
-            return (level_gap, -relevance, (hash(q["id"]) + seed) % 97)
+            custom = 6 if q.get("custom") else 0   # questions added in the admin panel come first
+            return rel * 3 + interest - level_gap * 2.5 + custom + ((hash(q["id"]) + seed) % 97) / 1000
 
-        return sorted(pool, key=rank)[0]
+        best = max(pool, key=rank)
+        rel, term = relation(best)
+        if rel >= 2 and term:
+            state["_last_link"] = _pretty_tech(term) if term in TECH_LEXICON else term
+        return best
 
     # ---------- closing ----------
     @staticmethod
@@ -589,7 +681,9 @@ The candidate just answered: "{answer}"
 To the question: "{cur['text']}"
 Concepts a strong answer covers: {', '.join(c for c in (record['covered'] + record['missing'])) or 'clarity, depth, examples'}.
 
-The NEXT thing you will ask (keep its meaning, you may lightly rephrase it to connect with what the candidate said, max 2 sentences): "{next_intent}"
+The NEXT thing you will ask: "{next_intent}"
+Rephrase it in at most 25 words (one or two short sentences) so it builds on something specific the candidate just said, e.g. "You mentioned X; ...".
+Keep the same topic and difficulty. Don't repeat their whole answer back.
 
 Return STRICT JSON:
 {{"score": 0-100 (how good the answer is for this level),
@@ -598,7 +692,7 @@ Return STRICT JSON:
   "missing": ["key concepts they missed"],
   "ideal_answer": "a crisp model answer in 2-3 sentences",
   "next_question": "the next question as you'd say it"}}"""
-        data = llm.generate_json(prompt)
+        data = llm.generate_json(prompt, fast=True)
         if not isinstance(data, dict):
             return
         try:
@@ -614,6 +708,7 @@ Return STRICT JSON:
             record["ideal"] = str(data["ideal_answer"])
         if data.get("acknowledgement"):
             record["llm_ack"] = str(data["acknowledgement"])
-        if nxt is not None and data.get("next_question") and nxt["kind"] != "closing":
-            nxt["text"] = str(data["next_question"]).strip()
+        rephrased = str(data.get("next_question") or "").strip()
+        if nxt is not None and rephrased and nxt["kind"] != "closing" and len(rephrased.split()) <= 32:
+            nxt["text"] = rephrased  # only accepted when it still fits in about two lines
             nxt["transition"] = ""

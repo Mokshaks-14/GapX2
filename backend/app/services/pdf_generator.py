@@ -82,6 +82,12 @@ class PDFNotesGenerator:
             flow.append(Paragraph("Key concepts", st["h2"]))
             items = [f"<b>{esc(c.get('name'))}</b>{(' — ' + esc(c.get('explanation'))) if c.get('explanation') else ''}" for c in concepts]
             flow.append(ListFlowable([ListItem(Paragraph(i, st["body"]), leftIndent=10) for i in items], bulletType="bullet", start="•", leftIndent=12))
+        explained = notes.get("explained") or []
+        if explained:
+            flow.append(Paragraph("Explained simply", st["h2"]))
+            for item in explained:
+                flow.append(KeepTogether([Paragraph(f"<b>{esc(item.get('point'))}</b>", st["body"]),
+                                          Paragraph(esc(item.get("explanation")), st["small"]), Spacer(1, 3)]))
         if notes.get("last_minute_notes"):
             flow += [Paragraph("Last-minute notes", st["h2"]), PDFNotesGenerator._bullets(notes["last_minute_notes"], st["body"])]
         if notes.get("code_example") and not compact:

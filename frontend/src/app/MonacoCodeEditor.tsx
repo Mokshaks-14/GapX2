@@ -19,6 +19,9 @@ interface MonacoCodeEditorProps {
   onChange: (newCode: string) => void;
   onSyntaxErrorChange?: (errors: SyntaxErrorItem[]) => void;
   theme?: 'dark' | 'light';
+  /** Blocks copy, cut, paste and drag-and-drop in the editor (on by default for practice) */
+  blockClipboard?: boolean;
+  onClipboardBlocked?: (action: 'paste' | 'copy' | 'cut' | 'drop') => void;
 }
 
 export default function MonacoCodeEditor({
@@ -26,8 +29,41 @@ export default function MonacoCodeEditor({
   language,
   onChange,
   onSyntaxErrorChange,
-  theme = 'dark'
+  theme = 'dark',
+  blockClipboard = true,
+  onClipboardBlocked,
 }: MonacoCodeEditorProps) {
+  const [clipNotice, setClipNotice] = useState<string | null>(null);
+  const noticeTimer = useRef<any>(null);
+  const blockedRef = useRef(onClipboardBlocked);
+  blockedRef.current = onClipboardBlocked;
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  const showBlocked = useCallback((action: 'paste' | 'copy' | 'cut' | 'drop') => {
+    setClipNotice(action === 'paste' || action === 'drop'
+      ? 'Pasting is disabled. Type your solution yourself.'
+      : 'Copying code is disabled in practice mode.');
+    clearTimeout(noticeTimer.current);
+    noticeTimer.current = setTimeout(() => setClipNotice(null), 2500);
+    blockedRef.current?.(action);
+  }, []);
+
+  // Browser-level guard: catches paste/copy/cut/drop events before Monaco sees them
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el || !blockClipboard) return;
+    const stop = (action: 'paste' | 'copy' | 'cut' | 'drop') => (e: Event) => {
+      e.preventDefault();
+      e.stopPropagation();
+      showBlocked(action);
+    };
+    const handlers: [string, EventListener][] = [
+      ['paste', stop('paste')], ['copy', stop('copy')], ['cut', stop('cut')], ['drop', stop('drop')],
+      ['dragover', (e: Event) => e.preventDefault()],
+    ];
+    handlers.forEach(([ev, h]) => el.addEventListener(ev, h, true));
+    return () => handlers.forEach(([ev, h]) => el.removeEventListener(ev, h, true));
+  }, [blockClipboard, showBlocked]);
   const editorRef = useRef<any>(null);
   const monacoRef = useRef<any>(null);
   const [syntaxErrors, setSyntaxErrors] = useState<SyntaxErrorItem[]>([]);
@@ -211,6 +247,26 @@ export default function MonacoCodeEditor({
     monacoRef.current = monaco;
     setIsEditorReady(true);
 
+    if (blockClipboard) {
+      const { KeyMod, KeyCode } = monaco;
+      // Keyboard shortcuts for paste / copy / cut do nothing except show the notice
+      editor.addCommand(KeyMod.CtrlCmd | KeyCode.KeyV, () => showBlocked('paste'));
+      editor.addCommand(KeyMod.Shift | KeyCode.Insert, () => showBlocked('paste'));
+      editor.addCommand(KeyMod.CtrlCmd | KeyMod.Shift | KeyCode.KeyV, () => showBlocked('paste'));
+      editor.addCommand(KeyMod.CtrlCmd | KeyCode.KeyC, () => showBlocked('copy'));
+      editor.addCommand(KeyMod.CtrlCmd | KeyCode.Insert, () => showBlocked('copy'));
+      editor.addCommand(KeyMod.CtrlCmd | KeyCode.KeyX, () => showBlocked('cut'));
+      editor.addCommand(KeyMod.Shift | KeyCode.Delete, () => showBlocked('cut'));
+      // Last line of defence: if a paste still lands (e.g. a browser extension), remove it straight away
+      editor.onDidPaste((e: any) => {
+        const model = editor.getModel();
+        if (model && e?.range) {
+          editor.executeEdits('block-paste', [{ range: e.range, text: '' }]);
+          showBlocked('paste');
+        }
+      });
+    }
+
     // Set editor options
     editor.updateOptions({
       fontSize: 13,
@@ -234,7 +290,12 @@ export default function MonacoCodeEditor({
   return (
     <div className="relative w-full h-full flex flex-col min-h-0 bg-[#1e1e1e] rounded-b-2xl overflow-hidden">
       {/* Monaco Editor Container */}
-      <div className="flex-1 w-full h-full min-h-0">
+      <div ref={containerRef} className="relative flex-1 w-full h-full min-h-0" onContextMenu={blockClipboard ? e => e.preventDefault() : undefined}>
+        {clipNotice && (
+          <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 px-3.5 py-2 rounded-lg bg-amber-500/95 text-zinc-950 text-xs font-semibold shadow-lg pointer-events-none">
+            <AlertCircle className="w-3.5 h-3.5" /> {clipNotice}
+          </div>
+        )}
         <Editor
           height="100%"
           language={getMonacoLanguage(language)}
@@ -253,7 +314,12 @@ export default function MonacoCodeEditor({
             bracketPairColorization: { enabled: true },
             glyphMargin: false,
             folding: true,
-            tabSize: 4
+            tabSize: 4,
+            // No right-click menu (it has Paste) and no drag-and-drop of text when the clipboard is blocked
+            contextmenu: !blockClipboard,
+            dragAndDrop: !blockClipboard,
+            dropIntoEditor: { enabled: !blockClipboard },
+            pasteAs: { enabled: !blockClipboard },
           }}
           loading={
             <div className="w-full h-full flex items-center justify-center bg-zinc-950 text-zinc-500 font-mono text-xs">

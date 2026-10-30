@@ -85,3 +85,35 @@ class BehaviorAnalyzer:
             "body_language_feedback": " ".join(tips) or "Steady eye contact and composed expression throughout. Well done.",
             "disclaimer": "Estimated from facial landmarks in your browser; treat it as a self-improvement guide, not an exact measurement.",
         }
+
+
+INTEGRITY_LABELS = {"multiple_faces": "another person visible", "background_motion": "movement in the background",
+                    "face_missing": "candidate left the camera view", "phone_detected": "mobile phone visible",
+                    "tab_switch": "switched to another tab or app", "fullscreen_exit": "left full screen",
+                    "paste_attempt": "tried to paste an answer"}
+
+
+def integrity_report(session: List[Dict[str, Any]], live_events: List[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Summarises proctoring warnings across the interview (which question they happened on)."""
+    counts: Dict[str, int] = {k: 0 for k in INTEGRITY_LABELS}
+    where: Dict[str, List[int]] = {k: [] for k in INTEGRITY_LABELS}
+    for e in live_events or []:
+        kind, q = e.get("type"), e.get("question")
+        if kind in counts:
+            counts[kind] += 1
+            if q and q not in where[kind]:
+                where[kind].append(q)
+    for i, frame in enumerate(session if not live_events else [], 1):
+        for event in frame.get("integrity_events") or []:
+            if event in counts:
+                counts[event] += 1
+                if i not in where[event]:
+                    where[event].append(i)
+    flagged = (counts["multiple_faces"] > 0 or counts["phone_detected"] > 0 or counts["paste_attempt"] > 0
+               or counts["tab_switch"] >= 2 or counts["fullscreen_exit"] >= 2
+               or counts["background_motion"] >= 2 or counts["face_missing"] >= 3)
+    parts = [f"{INTEGRITY_LABELS[k]} {n}x" + (f" (question {', '.join(map(str, where[k]))})" if where[k] else "") for k, n in counts.items() if n]
+    summary = ("Warnings: " + "; ".join(parts) + ".") if parts else "No integrity issues: no other people, phones, tab switches, pasting or background movement were detected."
+    if flagged:
+        summary += " In a real proctored interview this could be flagged for review."
+    return {"counts": counts, "answers": where, "flagged": flagged, "summary": summary}

@@ -28,8 +28,10 @@ MARKER = "\x1eGAPX_RESULT\x1e"
 TIME_LIMIT = 3.0          # seconds per test case
 COMPILE_LIMIT = 25.0      # seconds for javac / g++
 MAX_OUTPUT = 64 * 1024    # bytes of stdout/stderr kept per run
-SUPPORTED = ("python", "javascript", "java", "cpp")
-LANG_ALIASES = {"py": "python", "python3": "python", "js": "javascript", "node": "javascript", "c++": "cpp", "openjdk": "java"}
+SUPPORTED = ("python", "javascript", "java", "cpp", "c")
+LANG_ALIASES = {"py": "python", "python3": "python", "js": "javascript", "node": "javascript", "c++": "cpp", "openjdk": "java",
+                "gcc": "c", "c11": "c"}
+C_MARKER_LITERAL = r'"\x1e" "GAPX_RESULT" "\x1e"'  # the result marker as a C/C++ string literal
 
 
 def local_execution_allowed() -> bool:
@@ -692,8 +694,11 @@ def build_program(code: str, language: str, signature: Optional[Dict[str, Any]])
         user = re.sub(r"#include\s*<[^>]+>\s*", "", code).replace("using namespace std;", "")
         user = re.sub(r"struct\s+(ListNode|TreeNode)\s*\{[^}]*\};", "", user)
         helpers = CPP_HELPERS.replace("__GX_RET_VAL__", "true" if sig.get("returns") == "TreeNodeVal" else "false")
-        source = CPP_PRELUDE + helpers + "\n" + user + "\n" + _cpp_main(ret, name, ptypes).replace("__GX_MARKER__", marker)
+        source = CPP_PRELUDE + helpers + "\n" + user + "\n" + _cpp_main(ret, name, ptypes).replace("__GX_MARKER__", C_MARKER_LITERAL)
         return source, "solution.cpp"
+    if language == "c":
+        from app.services.c_support import build_c_program
+        return build_c_program(code, sig, C_MARKER_LITERAL), "solution.c"
     raise ValueError(f"Unsupported language: {language}")
 
 
@@ -798,9 +803,10 @@ class CodeExecutionService:
     # ---------- local ----------
     @staticmethod
     def _run_locally(source: str, filename: str, lang: str, test_cases: List[Dict[str, Any]], user_code: str, signature: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        tool = {"python": sys.executable, "javascript": shutil.which("node"), "java": shutil.which("javac"), "cpp": shutil.which("g++")}[lang]
+        tool = {"python": sys.executable, "javascript": shutil.which("node"), "java": shutil.which("javac"),
+                "cpp": shutil.which("g++"), "c": shutil.which("gcc")}[lang]
         if not tool:
-            name = {"javascript": "Node.js", "java": "a Java JDK (javac)", "cpp": "a C++ compiler (g++)"}[lang]
+            name = {"javascript": "Node.js", "java": "a Java JDK (javac)", "cpp": "a C++ compiler (g++)", "c": "a C compiler (gcc)"}[lang]
             return CodeExecutionService._error("Runtime Not Installed", f"{name} isn't installed on the server, so {lang} code can't run here. Install it, configure Judge0, or pick another language.")
 
         workdir = tempfile.mkdtemp(prefix="gapx_run_")
@@ -821,7 +827,8 @@ class CodeExecutionService:
                 cmd = [java_exe if os.path.exists(java_exe) else (shutil.which("java") or "java"), "-Xmx256m", "-cp", workdir, "SolutionRunner"]
             else:
                 exe = os.path.join(workdir, "solution.exe" if os.name == "nt" else "solution")
-                comp = _run([tool, "-std=c++17", "-O2", "-o", exe, path], workdir, timeout=COMPILE_LIMIT)
+                flags = ["-std=c11", "-O2", "-o", exe, path, "-lm"] if lang == "c" else ["-std=c++17", "-O2", "-o", exe, path]
+                comp = _run([tool] + flags, workdir, timeout=COMPILE_LIMIT)
                 if comp.returncode != 0:
                     return CodeExecutionService._compile_error(CodeExecutionService._cpp_compile_details(comp.stderr, source, user_code), test_cases)
                 cmd = [exe]
@@ -870,7 +877,7 @@ class CodeExecutionService:
     # ---------- Judge0 ----------
     @staticmethod
     def _run_via_judge0(source: str, lang: str, test_cases: List[Dict[str, Any]], user_code: str, signature: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        lang_ids = {"python": 71, "javascript": 63, "cpp": 54, "java": 62}
+        lang_ids = {"python": 71, "javascript": 63, "cpp": 54, "java": 62, "c": 50}
         headers = {"X-RapidAPI-Key": settings.JUDGE0_API_KEY, "X-RapidAPI-Host": "judge0-ce.p.rapidapi.com", "Content-Type": "application/json"}
         if lang == "java":  # Judge0 expects the public class to be called Main
             source = source.replace("public class SolutionRunner", "public class Main")
@@ -966,6 +973,8 @@ class CodeExecutionService:
             r"^(var|let|const)\s+\w+\s*=\s*function\s*\(.*?\)\s*\{\s*\}\s*;?\s*$",
             r"^(import\s+[^;]+;\s*)*(public\s+)?class\s+Solution\s*\{\s*public\s+[^{]+\{\s*(return\s+(null|false|0|-1|new\s+int\[\]\s*\{\s*\}|new\s+ArrayList<>\(\)|\"\")\s*;)?\s*\}\s*\}\s*$",
             r"^(#include\s*<[^>]+>\s*)*(using\s+namespace\s+std;\s*)?class\s+Solution\s*\{\s*public:\s*[^{]+\{\s*(return\s+(\{\}|false|0|-1|nullptr|\"\")\s*;)?\s*\}\s*\};\s*$",
+            # C starter: a single function whose body only resets *returnSize and returns a default
+            r"^(#include\s*<[^>]+>\s*)*[\w\s\*]+?\b\w+\s*\([^)]*\)\s*\{\s*(\*returnSize\s*=\s*0\s*;\s*)?(return\s+(NULL|0|0\.0|false|-1|\"\")\s*;)?\s*\}\s*$",
         ]
         return any(re.match(p, clean, re.DOTALL) for p in patterns)
 

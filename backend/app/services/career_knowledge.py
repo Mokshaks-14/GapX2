@@ -38,6 +38,10 @@ class CareerKnowledgeEngine:
             r'\b(paracetamol|medicine for|tablet for headache|cure disease|medical prescription|doctor prescription)\b',
             r'\b(horoscope today|zodiac sign compatibility|astrology prediction)\b',
             r'\b(how to get a girlfriend|how to get a boyfriend|dating tips|tinder profile tips|girlfriend|boyfriend|dating advice)\b',
+            r'\b(politics|election|prime minister|president of|celebrity|actor|actress|netflix|web series|anime|tv show|song|music video|lyrics)\b',
+            r'\b(stock tips|crypto price|bitcoin price|lottery|betting|gambling|horoscope|religion|god|tarot)\b',
+            r'\b(travel plan|tourist|hotel booking|restaurant|recipe|diet plan|weight loss|workout plan|gym routine|skincare|makeup|fashion)\b',
+            r'\b(joke|poem about|write a story|love letter|birthday wish|shayari)\b',
         ]
 
         # Exceptions where a word overlaps with an engineering/computing context

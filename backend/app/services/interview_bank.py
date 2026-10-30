@@ -675,7 +675,7 @@ BANK["fullstack"] = [
 # ─── SCENARIO / PROBLEM-SOLVING QUESTIONS ──────────────────────────────────────
 SCENARIOS: Dict[str, List[Dict[str, Any]]] = {
     "frontend": [Q("fe-s1", "Problem Solving", "Medium",
-                   "Here's a scenario. You're building a search box that calls an API on every keystroke, and the UI feels laggy with results sometimes showing out of order. How would you fix it?",
+                   "A search box calls an API on every keystroke, feels laggy, and shows results out of order. How would you fix it?",
                    [["debounce / throttle", "debounce", "throttle"], ["cancel stale requests (AbortController)", "abort", "cancel", "race", "stale", "out of order"],
                     ["cache results", "cache", "memo"], ["loading and empty states", "loading", "skeleton", "spinner", "empty state"], ["virtualise long result lists", "virtualiz", "pagination", "limit"]],
                    "Debounce input (about 300 ms) so you don't fire a request per keystroke, cancel in-flight requests with AbortController (or ignore responses that aren't the latest) to fix out-of-order results, cache previous queries, show loading and empty states, and virtualise or paginate long result lists.",
@@ -688,7 +688,7 @@ SCENARIOS: Dict[str, List[Dict[str, Any]]] = {
                   hint="Stop the bleeding first, then narrow down which part of the request got slower.")],
     "fullstack": [],
     "sde": [Q("sde-s1", "Problem Solving", "Medium",
-              "Let's do a quick problem. Given an array of integers and a target, find whether any two numbers add up to the target. Talk me through a brute-force approach and then optimise it.",
+              "Given an array and a target, how would you check if any two numbers add up to the target? Start with brute force, then optimise.",
               [["brute force O(n²)", "brute", "nested", "n^2", "n²", "n squared", "two loops"], ["hash set / map", "hash", "set", "map", "dictionary"], ["O(n) time", "o(n)", "linear", "one pass"],
                ["sorting + two pointers alternative", "sort", "two pointer"], ["edge cases", "edge case", "duplicate", "empty", "negative"]],
               "Brute force checks every pair with two loops: O(n²) time, O(1) space. Optimised: one pass with a hash set; for each x, check whether target − x is already in the set, then add x: O(n) time and O(n) space. Alternatively sort and use two pointers in O(n log n) with O(1) extra space. Handle empty arrays, duplicates and negatives.",
@@ -783,3 +783,22 @@ CANDIDATE_QUESTION_REPLIES = [
     (["tech", "stack", "tools", "technology"], "We use a modern stack and pick tools pragmatically. More important than knowing every tool is strong fundamentals and being comfortable learning new ones quickly."),
     (["improve", "feedback", "how did i", "how was"], "You'll get detailed feedback in your report right after this. In general, keep structuring answers clearly and backing them up with concrete examples from your projects."),
 ]
+
+
+# ─── QUESTIONS ADDED FROM THE ADMIN PANEL ──────────────────────────────────────
+def load_custom_questions(rows) -> int:
+    """Replaces the admin-added questions in BANK with `rows` (InterviewQuestion objects or dicts)."""
+    for track in BANK:
+        BANK[track] = [q for q in BANK[track] if not q.get("custom")]
+    count = 0
+    for r in rows:
+        get = (lambda k: r.get(k)) if isinstance(r, dict) else (lambda k: getattr(r, k))
+        track = get("track")
+        if track not in TRACKS:
+            continue
+        kw = [g for g in (get("key_points") or []) if g] or [[get("topic")]]
+        q = Q(f"custom-{get('id')}", get("topic"), get("level") or "Medium", get("question"), kw, get("ideal_answer"), [], get("hint") or "")
+        q["custom"] = True
+        BANK.setdefault(track, []).append(q)
+        count += 1
+    return count

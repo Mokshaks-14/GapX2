@@ -7,10 +7,14 @@ class UserCreate(BaseModel):
     email: str
     password: str
     full_name: Optional[str] = None
+    verification_code: Optional[str] = None  # 6-digit code emailed at sign-up
 
 class UserLogin(BaseModel):
     email: str
     password: str
+
+class EmailCheckRequest(BaseModel):
+    email: str
 
 class GoogleLoginRequest(BaseModel):
     credential: str  # Google Identity Services ID token
@@ -37,7 +41,7 @@ class UserOnboard(BaseModel):
     # Dynamic profile parameters
     college_name: Optional[str] = None
     degree_branch: Optional[str] = None
-    cgpa: Optional[float] = None
+    cgpa: Optional[Union[float, str]] = None
     graduation_year: Optional[str] = None
     current_company: Optional[str] = None
     current_designation: Optional[str] = None
@@ -47,6 +51,18 @@ class UserOnboard(BaseModel):
     current_domain: Optional[str] = None
     transition_timeline: Optional[str] = None
     switch_goal: Optional[str] = None
+
+    # Details that flow straight into the resume, roadmap and interview
+    semester_label: Optional[str] = None
+    phone: Optional[str] = None
+    location: Optional[str] = None
+    linkedin: Optional[str] = None
+    github: Optional[str] = None
+    portfolio: Optional[str] = None
+    project_title: Optional[str] = None
+    project_stack: Optional[str] = None
+    project_description: Optional[str] = None
+    interests: List[str] = []
 
 class UserResponse(BaseModel):
     id: int
@@ -66,6 +82,7 @@ class UserResponse(BaseModel):
     level: int
     streak: int
     badges: List[str]
+    profile_details: Optional[Dict[str, Any]] = None
     created_at: datetime
 
     class Config:
@@ -100,6 +117,10 @@ class ManualResumeCreate(BaseModel):
     interests: Optional[List[str]] = []
     is_fresher: Optional[bool] = None
 
+class JDMatchRequest(BaseModel):
+    job_description: str
+    resume: Optional[ManualResumeCreate] = None
+
 class ResumeSummaryResponse(BaseModel):
     summary: str
 
@@ -130,6 +151,7 @@ class RoadmapResponse(BaseModel):
     progress_percentage: float
     stages_data: List[Dict[str, Any]]
     estimated_completion_date: Optional[str]
+    study_plan: Optional[Dict[str, Any]] = None
 
     class Config:
         from_attributes = True
@@ -239,6 +261,7 @@ class InterviewStartResponse(BaseModel):
     track: Optional[str] = None
     track_label: Optional[str] = None
     total_questions: Optional[int] = None
+    speech_parts: Optional[List[str]] = None
 
 class InterviewMessageRequest(BaseModel):
     answer: str
@@ -252,6 +275,8 @@ class InterviewMessageRequest(BaseModel):
     filler_words_count: Optional[int] = None
     current_difficulty: Optional[str] = None
     topic_domain: Optional[str] = None
+    # Proctoring warnings raised in the browser while answering: multiple_faces, background_motion, face_missing
+    integrity_events: Optional[List[str]] = None
 
 class InterviewMessageResponse(BaseModel):
     next_question: Optional[str]  # None when finished
@@ -271,6 +296,7 @@ class InterviewMessageResponse(BaseModel):
     question_number: Optional[int] = None
     total_questions: Optional[int] = None
     turn_score: Optional[int] = None
+    speech_parts: Optional[List[str]] = None  # spoken in order: short reaction, then the question
 
 class InterviewFeedbackResponse(BaseModel):
     id: int
@@ -297,6 +323,7 @@ class MentorMessageRequest(BaseModel):
 class MentorMessageResponse(BaseModel):
     response: str
     suggestions: List[str]
+    spoken: Optional[str] = None  # short version read aloud in voice mode
 
 # --- DASHBOARD METRICS ---
 class DashboardMetricsResponse(BaseModel):

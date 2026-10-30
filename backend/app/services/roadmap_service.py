@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 from app.services import llm
 from app.services.interview_engine import detect_track
 from app.services.interview_bank import TRACKS
+from app.services.notes import EXPLAINED
 from app.services.roadmap_data import ROLE_ROADMAPS, youtube_link
 
 logger = logging.getLogger(__name__)
@@ -88,7 +89,9 @@ def topic_notes(topic_title: str, stage_title: str, role: str) -> Dict[str, Any]
         "executive_summary": f"{topic['description']} Estimated study time: about {topic['estimated_hours']} hours ({topic['difficulty']}).",
         "key_concepts": concepts,
         "last_minute_notes": topic["notes"],
-        "interview_questions": [{"question": q, "ideal_answer": a, "difficulty": topic["difficulty"]} for q, a in topic["qa"]],
+        "explained": [{"point": p, "explanation": e} for p, e in EXPLAINED.get(topic["title"], {}).get("simple", [])],
+        "interview_questions": [{"question": q, "ideal_answer": a, "difficulty": topic["difficulty"]}
+                                for q, a in topic["qa"] + EXPLAINED.get(topic["title"], {}).get("qa", [])],
         "common_pitfalls": topic["pitfalls"],
         "resources": {
             "docs": [{"title": t, "url": u} for t, u in topic["docs"]],
@@ -97,7 +100,7 @@ def topic_notes(topic_title: str, stage_title: str, role: str) -> Dict[str, Any]
         "summary": "Revise the last-minute notes the night before, then practise the interview question out loud.",
     }
     if llm.is_available():
-        extra = llm.generate_json(f"""For the topic "{topic['title']}" (preparing for a {role} role), return STRICT JSON:
+        extra = llm.generate_json(fast=True, prompt=f"""For the topic "{topic['title']}" (preparing for a {role} role), return STRICT JSON:
 {{"deep_dive": "a 120-180 word explanation of how it works under the hood, in plain language",
   "code_example": "a short, well-commented code example (or empty string if the topic isn't code-related)",
   "extra_questions": [{{"question": "...", "ideal_answer": "2-3 sentences"}}, {{"question": "...", "ideal_answer": "..."}}]}}""")
@@ -115,7 +118,7 @@ def topic_notes(topic_title: str, stage_title: str, role: str) -> Dict[str, Any]
 def _generic_notes(topic_title: str, stage_title: str, role: str) -> Dict[str, Any]:
     data = None
     if llm.is_available():
-        data = llm.generate_json(f"""Write last-minute interview revision notes on "{topic_title}" (part of "{stage_title}") for a {role} candidate.
+        data = llm.generate_json(fast=True, prompt=f"""Write last-minute interview revision notes on "{topic_title}" (part of "{stage_title}") for a {role} candidate.
 Return STRICT JSON: {{"executive_summary": "2-3 sentences", "key_concepts": [{{"name": "...", "explanation": "..."}}],
 "last_minute_notes": ["5-7 crisp bullets"], "interview_questions": [{{"question": "...", "ideal_answer": "...", "difficulty": "Medium"}}],
 "common_pitfalls": ["..."]}}""")
@@ -150,7 +153,103 @@ def topic_notes_offline(entry: Dict[str, Any], role: str) -> Dict[str, Any]:
         "title": topic["title"], "stage": entry["stage"]["title"], "role": role,
         "key_concepts": [{"name": c.partition(" — ")[0], "explanation": c.partition(" — ")[2]} for c in topic["concepts"]],
         "last_minute_notes": topic["notes"],
-        "interview_questions": [{"question": q, "ideal_answer": a} for q, a in topic["qa"]],
+        "explained": [{"point": p, "explanation": e} for p, e in EXPLAINED.get(topic["title"], {}).get("simple", [])],
+        "interview_questions": [{"question": q, "ideal_answer": a} for q, a in topic["qa"] + EXPLAINED.get(topic["title"], {}).get("qa", [])],
         "resources": {"docs": [{"title": t, "url": u} for t, u in topic["docs"]],
                       "videos": [{"title": q.title(), "url": youtube_link(q)} for q in topic["videos"]]},
     }
+
+
+# ─────────────────────────── personalised study plan ───────────────────────────
+import re as _re
+from datetime import date as _date, timedelta as _timedelta
+
+_MONTHS = {m: i for i, m in enumerate(["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+
+
+def _weeks_until(target: Optional[str], today: Optional[_date] = None) -> Optional[int]:
+    """Understands 'June 2026', 'Within 6 Months', '3 months', '2026-06-01'."""
+    if not target:
+        return None
+    today = today or _date.today()
+    t = target.lower()
+    m = _re.search(r"(\d+)\s*(month|week)", t)
+    if m:
+        n = int(m.group(1))
+        return max(1, n * 4 if m.group(2) == "month" else n)
+    m = _re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", t)
+    if m:
+        d = _date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        return max(1, (d - today).days // 7)
+    m = _re.search(r"([a-z]{3})[a-z]*\s+(\d{4})", t)
+    if m and m.group(1) in _MONTHS:
+        d = _date(int(m.group(2)), _MONTHS[m.group(1)], 1)
+        return max(1, (d - today).days // 7)
+    return None
+
+
+def personalise(stages: List[Dict[str, Any]], user: Any) -> List[Dict[str, Any]]:
+    """Adds personal notes to topics based on the user's skills, level and background."""
+    level = (getattr(user, "experience_level", "") or "Beginner").lower()
+    background = (getattr(user, "role", "") or "Student")
+    for s_idx, stage in enumerate(stages):
+        for topic in stage.get("topics", []):
+            tips = []
+            if topic.get("already_familiar"):
+                tips.append("You listed this skill, so skim the notes and practise the interview questions.")
+            if level in ("advanced", "intermediate") and topic.get("difficulty") == "Easy" and s_idx < 2:
+                topic["optional"] = True
+                tips.append("Foundational: review quickly at your level.")
+            if background == "Career Switcher" and s_idx == 0:
+                tips.append("Start here. Strong foundations make the switch much smoother.")
+            if background == "Working Professional" and "System Design" in stage.get("title", ""):
+                tips.append("Experienced candidates are tested heavily on this. Give it extra time.")
+            topic["personal_tip"] = " ".join(tips) or None
+    return stages
+
+
+def study_plan(stages: List[Dict[str, Any]], hours_per_day: Optional[int], target: Optional[str]) -> Dict[str, Any]:
+    """Splits the remaining topics into weeks (6 study days each), respecting the placement deadline."""
+    hpd = max(1, min(12, int(hours_per_day or 2)))
+    weekly = hpd * 6
+    remaining = []
+    for stage in stages:
+        for topic in stage.get("topics", []):
+            if topic.get("is_completed"):
+                continue
+            hours = topic.get("estimated_hours", 4)
+            if topic.get("already_familiar") or topic.get("optional"):
+                hours = max(1, round(hours / 2))
+            remaining.append({"stage_id": stage["id"], "topic_id": topic["id"], "title": topic["title"],
+                              "stage": stage["title"], "hours": hours})
+    total = sum(t["hours"] for t in remaining)
+    weeks_available = _weeks_until(target)
+
+    weeks, current, used = [], [], 0
+    for t in remaining:
+        if current and used + t["hours"] > weekly:
+            weeks.append({"topics": current, "hours": used})
+            current, used = [], 0
+        current.append(t)
+        used += t["hours"]
+    if current:
+        weeks.append({"topics": current, "hours": used})
+    start = _date.today()
+    for i, w in enumerate(weeks):
+        w["week"] = i + 1
+        w["starts"] = (start + _timedelta(weeks=i)).strftime("%d %b")
+        w["focus"] = w["topics"][0]["stage"]
+
+    needed = len(weeks)
+    summary = {"total_hours": total, "hours_per_day": hpd, "weeks_needed": needed, "weeks_available": weeks_available,
+               "on_track": weeks_available is None or needed <= weeks_available}
+    if weeks_available and needed > weeks_available:
+        summary["recommended_hours_per_day"] = min(12, -(-total // (weeks_available * 6)))
+        summary["message"] = (f"At {hpd} h/day you'll need about {needed} weeks, but your target is in {weeks_available}. "
+                              f"Study about {summary['recommended_hours_per_day']} h/day, or skim the topics you already know.")
+    elif needed == 0:
+        summary["message"] = "Every topic is complete. Focus on mock interviews and coding practice now."
+    else:
+        summary["message"] = f"At {hpd} h/day you'll finish in about {needed} weeks" + \
+            (f", comfortably before your target ({weeks_available} weeks away)." if weeks_available else ".")
+    return {"summary": summary, "weeks": weeks}

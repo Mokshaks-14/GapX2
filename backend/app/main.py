@@ -8,7 +8,7 @@ from app import models
 from app.core.config import settings
 from app.core.database import SessionLocal, engine
 from app.core.migrations import upgrade_schema
-from app.routers import admin, auth, coding, interviews, mentor, resumes, roadmaps, users
+from app.routers import admin, auth, coding, interviews, mentor, resumes, roadmaps, tts, users
 from app.services.problem_bank import ALL_PROBLEMS as PROBLEMS_DATA
 
 logging.basicConfig(level=logging.INFO)
@@ -28,14 +28,14 @@ app.add_middleware(
     expose_headers=["Content-Disposition"],
 )
 
-for router in (auth, users, resumes, roadmaps, coding, interviews, mentor, admin):
+for router in (auth, users, resumes, roadmaps, coding, interviews, mentor, admin, tts):
     app.include_router(router.router, prefix=settings.API_V1_STR)
 
 PROBLEM_FIELDS = [
     "difficulty", "category", "company_tags", "problem_statement", "constraints", "input_format",
     "output_format", "example_input", "example_output", "explanation", "expected_time_complexity",
     "expected_space_complexity", "starter_code_python", "starter_code_java", "starter_code_cpp",
-    "starter_code_js", "hints", "test_cases", "editorial", "signature",
+    "starter_code_js", "starter_code_c", "hints", "test_cases", "editorial", "signature",
 ]
 
 
@@ -56,11 +56,34 @@ def seed_problems(db: Session) -> None:
     logger.info("Problem bank synchronized: %d problems (%d new).", len(PROBLEMS_DATA), added)
 
 
+def ensure_admin_account(db: Session) -> None:
+    """Creates (or updates) the admin-panel account from ADMIN_EMAIL / ADMIN_PASSWORD in backend/.env."""
+    from app.core.security import get_password_hash, verify_password
+    email = (settings.ADMIN_EMAIL or "").strip().lower()
+    if not email or not settings.ADMIN_PASSWORD:
+        return
+    user = db.query(models.User).filter(models.User.email == email).first()
+    if user is None:
+        user = models.User(email=email, full_name="GapX Admin", password_hash=get_password_hash(settings.ADMIN_PASSWORD), role="Admin")
+        db.add(user)
+    elif not verify_password(settings.ADMIN_PASSWORD, user.password_hash):
+        user.password_hash = get_password_hash(settings.ADMIN_PASSWORD)
+    user.is_admin = True
+    user.is_active = True
+    db.commit()
+    logger.info("Admin panel account ready: %s", email)
+
+
 @app.on_event("startup")
 def startup_event():
     db = SessionLocal()
     try:
         seed_problems(db)
+        ensure_admin_account(db)
+        from app.services.interview_bank import load_custom_questions
+        n = load_custom_questions(db.query(models.InterviewQuestion).all())
+        if n:
+            logger.info("Loaded %d interview questions added from the admin panel.", n)
     finally:
         db.close()
 

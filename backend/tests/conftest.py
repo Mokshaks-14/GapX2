@@ -12,6 +12,9 @@ os.environ["OPENAI_API_KEY"] = ""
 os.environ["JUDGE0_API_KEY"] = ""
 os.environ["ENVIRONMENT"] = "development"
 os.environ["ADMIN_EMAILS"] = "boss@gapx.test"
+os.environ["EMAIL_DOMAIN_CHECK"] = "false"
+os.environ["EMAIL_VERIFICATION_REQUIRED"] = "false"  # verification has its own tests
+os.environ["SMTP_HOST"] = ""  # tests use fake domains; the checker has its own tests
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
@@ -25,7 +28,7 @@ def client():
         yield c
 
 
-def register(client, email, password="Secret123!", name="Test User"):
+def register(client, email, password="Gx!9vQ#tRw42", name="Test User"):
     r = client.post("/api/v1/auth/register", json={"email": email, "password": password, "full_name": name})
     assert r.status_code == 200, r.text
     return {"Authorization": f"Bearer {r.json()['access_token']}"}

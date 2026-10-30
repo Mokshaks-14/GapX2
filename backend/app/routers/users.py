@@ -99,6 +99,10 @@ def onboard_user(
     current_user: models.User = Depends(get_current_user)
 ):
     from sqlalchemy.orm.attributes import flag_modified
+    from app.services.validation import onboarding_problems
+    problems = onboarding_problems(onboard_data.model_dump())
+    if problems:
+        raise HTTPException(status_code=400, detail=" ".join(problems))
     
     current_user.role = onboard_data.role
     
@@ -146,6 +150,8 @@ def onboard_user(
     current_user.expected_placement_date = onboard_data.expected_placement_date or "Within 6 Months"
     current_user.target_roles = onboard_data.target_roles or ["Software Engineer"]
     
+    current_user.profile_details = {k: v for k, v in onboard_data.model_dump().items() if v not in (None, "", [])}
+    flag_modified(current_user, "profile_details")
     flag_modified(current_user, "skills")
     flag_modified(current_user, "languages_known")
     flag_modified(current_user, "target_roles")

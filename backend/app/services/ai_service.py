@@ -14,6 +14,26 @@ from app.services.resume_parser import ResumeEntityExtractor
 logger = logging.getLogger(__name__)
 
 
+OUT_OF_SCOPE_REPLY = ("I can only help with placement preparation, technical topics and using GapX, "
+                      "so I can't answer that one.")
+
+
+def _spoken_summary(markdown: str, max_words: int = 40) -> str:
+    """A short, speakable version of an answer (no code or markdown)."""
+    text = re.sub(r"```.*?```", " ", markdown or "", flags=re.S)
+    text = re.sub(r"[#*_`>|]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    sentences = re.findall(r"[^.!?]+[.!?]", text) or [text]
+    out, count = [], 0
+    for sent in sentences:
+        n = len(sent.split())
+        if out and count + n > max_words:
+            break
+        out.append(sent.strip())
+        count += n
+    return " ".join(out)[:400]
+
+
 class AIService:
 
     # ── RESUME ────────────────────────────────────────────────────────────────
@@ -112,40 +132,78 @@ Return plain text only.
         parts.append(goal + ".")
         return " ".join(parts)
 
-    # ── AI MENTOR ─────────────────────────────────────────────────────────────
+    # ── AI MENTOR / ASSISTANT ─────────────────────────────────────────────────
     @staticmethod
-    def get_career_advice(query: str, history: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
+    def get_career_advice(query: str, history: Optional[List[Dict[str, str]]] = None,
+                          profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """A conversational assistant (via the configured LLM), personalised with the user's profile."""
         history = history or []
-        if not CareerKnowledgeEngine.is_in_scope(query):
-            return {
-                "response": CareerKnowledgeEngine.OUT_OF_SCOPE_MESSAGE,
-                "suggestions": [
-                    "How to prepare for technical interviews?",
-                    "Solve Two Sum in Python",
-                    "Tips to improve communication skills for interviews",
-                ],
-            }
-
+        if not CareerKnowledgeEngine.is_in_scope(query):  # obvious off-topic: answer instantly, no AI call
+            return AIService._out_of_scope()
         if llm.is_available():
-            prompt = f"""You are GapX AI Mentor: an empathetic career coach and senior engineer.
-Answer questions about interviews, coding, data structures & algorithms, computer science, any engineering subject, and communication skills.
-If the question is unrelated (cooking, movies, sports, weather, medical, dating), reply exactly:
-"I am designed only to answer questions related to interview, technical or communication skills only, so sorry I will not be able to answer this question."
-For code: give complete, commented code plus time/space complexity. For career questions: give concrete frameworks (STAR, XYZ) and examples.
-Format the answer in Markdown.
+            context = ""
+            if profile:
+                context = "\n".join(f"- {k}: {v}" for k, v in profile.items() if v not in (None, "", [], {}))
+            system = f"""You are GapX AI Coach, the assistant inside GapX, a placement-preparation app.
 
-Return STRICT JSON: {{"response": "markdown answer", "suggestions": ["follow-up 1", "follow-up 2", "follow-up 3"]}}
+SCOPE: answer ONLY questions about what GapX helps with:
+- coding, data structures & algorithms, and code in any language
+- computer science and engineering subjects (OS, DBMS, networks, OOP, system design, ML/AI, web, cloud, security, maths for CS)
+- placement and interview preparation (technical, HR, behavioral, aptitude), resumes, LinkedIn/GitHub profiles
+- career guidance for tech roles, study plans and roadmaps, communication and soft skills for interviews
+- how to use GapX features: Dashboard, AI Roadmap and notes, Resume builder and job-description match, Coding Practice, Mock Interview, daily challenge
+For ANYTHING else (movies, sports, food, news, politics, health, relationships, general trivia, homework unrelated to tech careers, etc.)
+reply with exactly this sentence and nothing else:
+"{OUT_OF_SCOPE_REPLY}"
 
-Chat history: {json.dumps(history[-6:])}
-User: {query}"""
-            parsed = llm.generate_json(prompt)
-            if isinstance(parsed, dict) and parsed.get("response"):
-                return {
-                    "response": str(parsed["response"]),
-                    "suggestions": [str(s) for s in (parsed.get("suggestions") or [])][:3],
-                }
+STYLE: warm, encouraging, like a senior mentor. Explain in simple words first, then add depth.
+For code: complete, commented code plus time/space complexity. Use Markdown. Keep answers focused.
 
-        return CareerKnowledgeEngine.get_response(query, history)
+About the user (use it to personalise; don't recite it):
+{{context}}
+
+At the very end of every reply add two lines exactly in this format:
+SPOKEN: <the key point of your answer in 1-2 natural spoken sentences, max 40 words, no markdown or code>
+FOLLOW_UPS: <short follow-up question 1> | <short follow-up question 2> | <short follow-up question 3>""".replace("{{context}}", context or "- (no profile yet)")
+            messages = [{"role": "system", "content": system}]
+            for m in history[-12:]:
+                text = (m.get("text") or m.get("content") or "").strip()
+                if not text:
+                    continue
+                messages.append({"role": "user" if m.get("role") == "user" else "assistant", "content": text})
+            messages.append({"role": "user", "content": query})
+            reply = llm.chat(messages)
+            if reply:
+                suggestions: List[str] = []
+                spoken = ""
+                match = re.search(r"\n?\s*\**FOLLOW_UPS:?\**\s*(.+)\s*$", reply, re.IGNORECASE)
+                if match:
+                    suggestions = [x.strip(" -*") for x in match.group(1).split("|") if x.strip(" -*")][:3]
+                    reply = reply[:match.start()].rstrip()
+                match = re.search(r"\n?\s*\**SPOKEN:?\**\s*(.+)\s*$", reply, re.IGNORECASE)
+                if match:
+                    spoken = match.group(1).strip()
+                    reply = reply[:match.start()].rstrip()
+                if OUT_OF_SCOPE_REPLY[:40] in reply:
+                    return AIService._out_of_scope()
+                return {"response": reply, "spoken": spoken or _spoken_summary(reply),
+                        "suggestions": suggestions or ["Can you explain that with an example?", "What should I practise next?", "How is this asked in interviews?"]}
+
+        # Offline engine (no model configured or reachable)
+        if not CareerKnowledgeEngine.is_in_scope(query):
+            return AIService._out_of_scope()
+        res = CareerKnowledgeEngine.get_response(query, history)
+        res["spoken"] = _spoken_summary(res.get("response", ""))
+        return res
+
+    @staticmethod
+    def _out_of_scope() -> Dict[str, Any]:
+        return {
+            "response": OUT_OF_SCOPE_REPLY + "\n\nYou can ask me about coding and DSA, CS and engineering topics, interviews, resumes, "
+                        "your roadmap, communication skills, or how to use any GapX feature.",
+            "spoken": OUT_OF_SCOPE_REPLY,
+            "suggestions": ["How do I prepare for a technical interview?", "Explain hash maps simply", "How do I use the AI Roadmap?"],
+        }
 
     # ── CODING HINTS ──────────────────────────────────────────────────────────
     @staticmethod

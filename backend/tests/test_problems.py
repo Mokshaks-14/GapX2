@@ -452,3 +452,34 @@ def test_cpp_runs_or_reports_missing_compiler():
         assert res["status"] == "Accepted", res
     else:
         assert res["status"] == "Runtime Not Installed"
+
+
+C_SOLUTIONS = {
+    "Two Sum": "int* twoSum(int* nums, int numsSize, int target, int* returnSize) {\n    int* r = malloc(2 * sizeof(int)); *returnSize = 2;\n    for (int i = 0; i < numsSize; i++) for (int j = i + 1; j < numsSize; j++) if (nums[i] + nums[j] == target) { r[0] = i; r[1] = j; return r; }\n    *returnSize = 0; return r;\n}",
+    "Reverse Linked List": "struct ListNode* reverseList(struct ListNode* head) {\n    struct ListNode* prev = NULL;\n    while (head) { struct ListNode* n = head->next; head->next = prev; prev = head; head = n; }\n    return prev;\n}",
+    "Valid Palindrome": "bool isPalindrome(char* s) {\n    int i = 0, j = (int)strlen(s) - 1;\n    while (i < j) { if (!isalnum((unsigned char)s[i])) i++; else if (!isalnum((unsigned char)s[j])) j--; else { if (tolower((unsigned char)s[i]) != tolower((unsigned char)s[j])) return false; i++; j--; } }\n    return true;\n}",
+    "Move Zeroes": "void moveZeroes(int* nums, int numsSize) {\n    int w = 0; for (int i = 0; i < numsSize; i++) if (nums[i]) { int t = nums[w]; nums[w] = nums[i]; nums[i] = t; w++; }\n}",
+    "Longest Common Prefix": "char* longestCommonPrefix(char** strs, int strsSize) {\n    int n = strlen(strs[0]);\n    for (int i = 1; i < strsSize; i++) { int k = 0; while (k < n && strs[i][k] && strs[i][k] == strs[0][k]) k++; n = k; }\n    char* r = malloc(n + 1); memcpy(r, strs[0], n); r[n] = 0; return r;\n}",
+    "Lowest Common Ancestor of Binary Tree": "struct TreeNode* lowestCommonAncestor(struct TreeNode* root, struct TreeNode* p, struct TreeNode* q) {\n    if (!root || root == p || root == q) return root;\n    struct TreeNode* l = lowestCommonAncestor(root->left, p, q); struct TreeNode* r = lowestCommonAncestor(root->right, p, q);\n    return (l && r) ? root : (l ? l : r);\n}",
+    "Median of Two Sorted Arrays": "double findMedianSortedArrays(int* a, int n, int* b, int m) {\n    int* c = malloc(sizeof(int) * (n + m)); int i = 0, j = 0, k = 0;\n    while (i < n || j < m) c[k++] = (j >= m || (i < n && a[i] <= b[j])) ? a[i++] : b[j++];\n    return (n + m) % 2 ? c[(n + m) / 2] : (c[(n + m) / 2 - 1] + c[(n + m) / 2]) / 2.0;\n}",
+}
+
+
+def test_c_starter_is_detected_as_unimplemented():
+    p = BY_TITLE["Two Sum"]
+    res = CodeExecutionService.execute_code(p["starter_code_c"], "c", p["test_cases"], p["signature"])
+    assert res["status"] == "Wrong Answer" and "starter" in res["message"]
+
+
+def test_c_unsupported_problem_explains_itself():
+    p = BY_TITLE["Merge Intervals"]
+    res = CodeExecutionService.execute_code("int x(void){return 1;}\nint y(void){return 2;}", "c", p["test_cases"], p["signature"])
+    assert res["status"] == "Unsupported Signature"
+
+
+@pytest.mark.skipif(shutil.which("gcc") is None, reason="gcc not installed")
+@pytest.mark.parametrize("title", list(C_SOLUTIONS))
+def test_c_runner(title):
+    p = BY_TITLE[title]
+    res = CodeExecutionService.execute_code(C_SOLUTIONS[title], "c", p["test_cases"], p["signature"])
+    assert res["status"] == "Accepted", (title, res["message"], res.get("error_details"), res["test_results"][:2])
